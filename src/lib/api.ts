@@ -51,6 +51,7 @@ export const bigfixApi = {
   deleteConsole: (id: string) => callEdgeFunction('delete-console', { id }),
   listComputers: (consoleId: string) => callEdgeFunction('list-computers', { consoleId }),
   listContent: (consoleId: string, type?: string, siteId?: string) => callEdgeFunction('list-content', { consoleId, type, siteId }),
+  listApplicableComputers: (consoleId: string, contentId: string) => callEdgeFunction('list-applicable-computers', { consoleId, contentId }),
   listActions: (consoleId: string, status?: string) => callEdgeFunction('list-actions', { consoleId, status }),
   listActionResults: (actionId: string) => callEdgeFunction('list-action-results', { actionId }),
   listFailedResults: (consoleId: string) => callEdgeFunction('list-failed-results', { consoleId }),

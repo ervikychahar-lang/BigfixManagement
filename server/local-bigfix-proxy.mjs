@@ -665,6 +665,31 @@ async function queryContent(consoleConfig, contentType, siteName) {
   return [];
 }
 
+async function queryApplicableComputers(consoleConfig, content) {
+  const objectType = contentRelevanceType(content.type);
+  const filters = [`id of it as string = ${JSON.stringify(String(content.bigfix_id || ''))}`];
+  const siteName = decodeBigFixValue(content.site_id || content.source_name || '');
+  if (siteName) filters.push(`name of site of it = ${JSON.stringify(siteName)}`);
+  const relevance = `(id of it as string, name of it | "", operating system of it | "", concatenation "," of ip addresses of it, last report time of it as string | "", if exists client version of it then client version of it as string else "", if active flag of it then "true" else "false") of applicable computers of ${objectType} whose (${filters.join(' and ')})`;
+  const rows = parseTupleQueryXML(await bigfixRequest(consoleConfig, `/query?relevance=${encodeURIComponent(relevance)}`));
+  const seen = new Set();
+  return rows
+    .map(row => ({
+      bigfix_id: row[0] || '',
+      name: row[1] || row[0] || '',
+      os: row[2] || '',
+      ip_address: row[3] || '',
+      last_report: row[4] || null,
+      agent_version: row[5] || '',
+      is_online: row[6] === 'true',
+    }))
+    .filter(item => {
+      if (!item.bigfix_id || seen.has(item.bigfix_id)) return false;
+      seen.add(item.bigfix_id);
+      return true;
+    });
+}
+
 async function queryActions(consoleConfig) {
   const relevance = '(id of it as string, name of it | "", state of it as string | "", issuer name of it | "", time issued of it as string | "") of bes actions';
   try {
@@ -964,6 +989,27 @@ async function handleAction(body) {
         data = data.filter(item => decodeBigFixValue(item.site_id) === body.siteId || decodeBigFixValue(item.source_name) === body.siteId);
       }
       return { data: sortByCreatedDesc(data) };
+    }
+
+    case 'list-applicable-computers': {
+      const consoleConfig = getConsole(db, body.consoleId);
+      const content = db.bigfix_content.find(item => item.id === body.contentId && item.console_id === body.consoleId);
+      if (!content) throw new Error('Content not found');
+      const applicable = await queryApplicableComputers(consoleConfig, content);
+      const data = applicable.map(item => {
+        const cached = db.bigfix_computers.find(computer => computer.console_id === body.consoleId && computer.bigfix_id === item.bigfix_id);
+        return {
+          id: cached?.id || item.bigfix_id,
+          console_id: body.consoleId,
+          subnet: cached?.subnet || '',
+          custom_site_count: cached?.custom_site_count || 0,
+          created_at: cached?.created_at || now(),
+          updated_at: cached?.updated_at || now(),
+          ...cached,
+          ...item,
+        };
+      }).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+      return { data, count: data.length };
     }
 
     case 'list-sites':

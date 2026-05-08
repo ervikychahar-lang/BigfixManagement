@@ -1,7 +1,8 @@
 import { useState, useMemo } from 'react';
-import { useContent, useConsoles, useComputers, useSites } from '../hooks/useBigFix';
+import { useContent, useConsoles, useSites } from '../hooks/useBigFix';
 import { Shield, Wrench, Layers, Bug, Search, RefreshCw, Play, ChevronDown, ChevronUp, Filter, EyeOff, ListFilter } from 'lucide-react';
-import type { ContentType, BigFixContent, ContentSeverity } from '../lib/api';
+import { bigfixApi } from '../lib/api';
+import type { ContentType, BigFixContent, ContentSeverity, BigFixComputer } from '../lib/api';
 
 const TYPE_CONFIG: Record<ContentType, { label: string; icon: typeof Shield; color: string; bg: string; border: string }> = {
   fixlet: { label: 'Fixlets', icon: Shield, color: 'text-emerald-600', bg: 'bg-emerald-50', border: 'border-emerald-200' },
@@ -25,7 +26,6 @@ export default function ContentManager() {
   const [selectedSite, setSelectedSite] = useState('all');
   const { sites, syncFromConsole: syncSites } = useSites(consoleId);
   const { items, loading, syncFromConsole, deployAction } = useContent(consoleId, activeType, selectedSite);
-  const { computers } = useComputers(consoleId);
   const [syncing, setSyncing] = useState(false);
   const [search, setSearch] = useState('');
   const [severityFilter, setSeverityFilter] = useState<ContentSeverity | 'all'>('all');
@@ -36,6 +36,9 @@ export default function ContentManager() {
   const [applying, setApplying] = useState<string | null>(null);
   const [showApplyModal, setShowApplyModal] = useState<BigFixContent | null>(null);
   const [selectedComputers, setSelectedComputers] = useState<Set<string>>(new Set());
+  const [applicableComputers, setApplicableComputers] = useState<BigFixComputer[]>([]);
+  const [loadingApplicable, setLoadingApplicable] = useState(false);
+  const [applicableError, setApplicableError] = useState('');
   const [actionName, setActionName] = useState('');
 
   const handleSync = async () => {
@@ -72,31 +75,50 @@ export default function ContentManager() {
     sortField === field ? (sortDir === 'asc' ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />) : null
   );
 
+  const openApplyModal = async (content: BigFixContent) => {
+    if (!consoleId) return;
+    setShowApplyModal(content);
+    setSelectedComputers(new Set());
+    setActionName('');
+    setApplicableComputers([]);
+    setApplicableError('');
+    setLoadingApplicable(true);
+    try {
+      const result = await bigfixApi.listApplicableComputers(consoleId, content.id) as { data?: BigFixComputer[] };
+      const targets = result.data || [];
+      setApplicableComputers(targets);
+      setSelectedComputers(new Set(targets.map(computer => computer.bigfix_id).filter(Boolean)));
+    } catch (error) {
+      console.error(error);
+      setApplicableError(error instanceof Error ? error.message : 'Failed to fetch applicable computers');
+    } finally {
+      setLoadingApplicable(false);
+    }
+  };
+
   const handleApply = async (content: BigFixContent) => {
     setApplying(content.id);
     try {
-      const targetBigfixIds = Array.from(selectedComputers).map(dbId => {
-        const comp = computers.find(c => c.id === dbId);
-        return comp?.bigfix_id || '';
-      }).filter(Boolean);
+      const targetBigfixIds = Array.from(selectedComputers).filter(Boolean);
       await deployAction(content.id, targetBigfixIds, actionName || `Apply: ${content.name}`);
       setShowApplyModal(null);
       setSelectedComputers(new Set());
+      setApplicableComputers([]);
       setActionName('');
     } finally { setApplying(null); }
   };
 
-  const toggleComputer = (id: string) => {
+  const toggleComputer = (bigfixId: string) => {
     setSelectedComputers(prev => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
+      if (next.has(bigfixId)) next.delete(bigfixId); else next.add(bigfixId);
       return next;
     });
   };
 
   const selectAllComputers = () => {
-    if (selectedComputers.size === computers.length) setSelectedComputers(new Set());
-    else setSelectedComputers(new Set(computers.map(c => c.id)));
+    if (selectedComputers.size === applicableComputers.length) setSelectedComputers(new Set());
+    else setSelectedComputers(new Set(applicableComputers.map(c => c.bigfix_id).filter(Boolean)));
   };
 
   const typeConfig = TYPE_CONFIG[activeType];
@@ -210,7 +232,8 @@ export default function ContentManager() {
                 {filtered.map((item, i) => {
                   const sev = SEVERITY_STYLES[item.severity];
                   return (
-                    <tr key={item.id} className={`border-b border-gray-100 hover:bg-gray-50 transition-colors ${i % 2 === 0 ? '' : 'bg-gray-50/30'}`}>
+                    <tr key={item.id} onClick={() => openApplyModal(item)}
+                      className={`border-b border-gray-100 hover:bg-gray-50 transition-colors cursor-pointer ${i % 2 === 0 ? '' : 'bg-gray-50/30'}`}>
                       <td className="px-4 py-3 text-gray-500 font-mono text-xs">{item.bigfix_id}</td>
                       <td className="px-4 py-3">
                         <p className="font-medium text-gray-900">{item.name}</p>
@@ -225,9 +248,9 @@ export default function ContentManager() {
                         {item.is_hidden && <span className="inline-flex mt-1 px-1.5 py-0.5 bg-gray-100 text-gray-500 rounded text-[10px] font-medium">hidden</span>}
                       </td>
                       <td className="px-4 py-3">
-                        <button onClick={() => { setShowApplyModal(item); setSelectedComputers(new Set()); setActionName(''); }}
+                        <button onClick={event => { event.stopPropagation(); openApplyModal(item); }}
                           className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-xs font-medium">
-                          <Play className="w-3 h-3" /> Deploy
+                          <Play className="w-3 h-3" /> Applicable
                         </button>
                       </td>
                     </tr>
@@ -255,26 +278,38 @@ export default function ContentManager() {
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <label className="text-sm font-medium text-gray-700">Target Computers ({selectedComputers.size} selected)</label>
-                  <button onClick={selectAllComputers} className="text-xs text-blue-600 hover:text-blue-700 font-medium">
-                    {selectedComputers.size === computers.length ? 'Deselect All' : 'Select All'}
+                  <button onClick={selectAllComputers} disabled={loadingApplicable || applicableComputers.length === 0}
+                    className="text-xs text-blue-600 hover:text-blue-700 font-medium disabled:text-gray-400">
+                    {selectedComputers.size === applicableComputers.length && applicableComputers.length > 0 ? 'Deselect All' : 'Select All'}
                   </button>
                 </div>
                 <div className="border border-gray-200 rounded-lg max-h-48 overflow-y-auto">
-                  {computers.map(c => (
-                    <label key={c.id} className="flex items-center gap-2 px-3 py-2 hover:bg-gray-50 cursor-pointer border-b border-gray-50 last:border-0">
-                      <input type="checkbox" checked={selectedComputers.has(c.id)} onChange={() => toggleComputer(c.id)}
-                        className="rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
-                      <span className="text-sm text-gray-700">{c.name}</span>
-                      <span className="text-xs text-gray-400 ml-auto">{c.os}</span>
-                      <span className="text-xs text-gray-300 font-mono">{c.bigfix_id}</span>
-                    </label>
-                  ))}
+                  {loadingApplicable ? (
+                    <div className="flex items-center justify-center py-8 text-sm text-gray-500">
+                      <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-blue-600 mr-2" />
+                      Fetching applicable computers from BigFix...
+                    </div>
+                  ) : applicableError ? (
+                    <div className="px-3 py-4 text-sm text-red-600 bg-red-50">{applicableError}</div>
+                  ) : applicableComputers.length === 0 ? (
+                    <div className="px-3 py-4 text-sm text-gray-500">No applicable computers returned by BigFix for this content.</div>
+                  ) : (
+                    applicableComputers.map(c => (
+                      <label key={c.bigfix_id} className="flex items-center gap-2 px-3 py-2 hover:bg-gray-50 cursor-pointer border-b border-gray-50 last:border-0">
+                        <input type="checkbox" checked={selectedComputers.has(c.bigfix_id)} onChange={() => toggleComputer(c.bigfix_id)}
+                          className="rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
+                        <span className="text-sm text-gray-700">{c.name}</span>
+                        <span className="text-xs text-gray-400 ml-auto">{c.os}</span>
+                        <span className="text-xs text-gray-300 font-mono">{c.bigfix_id}</span>
+                      </label>
+                    ))
+                  )}
                 </div>
               </div>
             </div>
             <div className="p-4 border-t border-gray-200 flex items-center justify-end gap-3">
               <button onClick={() => setShowApplyModal(null)} className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg transition-colors">Cancel</button>
-              <button onClick={() => handleApply(showApplyModal)} disabled={applying === showApplyModal.id || selectedComputers.size === 0}
+              <button onClick={() => handleApply(showApplyModal)} disabled={loadingApplicable || applying === showApplyModal.id || selectedComputers.size === 0}
                 className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors text-sm font-medium">
                 {applying === showApplyModal.id ? 'Deploying...' : 'Deploy Action'}
               </button>

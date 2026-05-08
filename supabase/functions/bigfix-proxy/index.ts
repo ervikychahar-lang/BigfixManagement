@@ -196,6 +196,24 @@ function parseActionsXML(xml: string): Array<Record<string, string>> {
   return actions;
 }
 
+function parseTupleQueryXML(xml: string): string[][] {
+  const tuples: string[][] = [];
+  const tupleRegex = /<Tuple\b[^>]*>([\s\S]*?)<\/Tuple>/g;
+  let tupleMatch;
+  while ((tupleMatch = tupleRegex.exec(xml)) !== null) {
+    const answers = [...tupleMatch[1].matchAll(/<Answer\b[^>]*>([\s\S]*?)<\/Answer>/g)].map(match => cleanXmlText(match[1]));
+    if (answers.length > 0) tuples.push(answers);
+  }
+  if (tuples.length > 0) return tuples;
+  return [...xml.matchAll(/<Answer\b[^>]*>([\s\S]*?)<\/Answer>/g)].map(match => [cleanXmlText(match[1])]);
+}
+
+function contentRelevanceType(contentType: string) {
+  if (contentType === "task") return "bes tasks";
+  if (contentType === "baseline") return "bes baselines";
+  return "bes fixlets";
+}
+
 function parseActionStatusXML(xml: string): Array<Record<string, string>> {
   const results: Array<Record<string, string>> = [];
   const resultRegex = /<Result\b[^>]*>([\s\S]*?)<\/Result>/g;
@@ -474,6 +492,47 @@ Deno.serve(async (req: Request) => {
         }
 
         return jsonResponse({ success: true, count: parsed.length, message: `Synced ${parsed.length} ${contentType}s` });
+      }
+
+      case "list-applicable-computers": {
+        const { consoleId, contentId } = body;
+        const console = await getConsole(supabase, consoleId);
+        const contentData = await supabase.from("bigfix_content")
+          .select("*").eq("id", contentId).eq("console_id", consoleId).maybeSingle();
+        if (!contentData.data) throw new Error("Content not found");
+
+        const content = contentData.data as Record<string, string>;
+        const objectType = contentRelevanceType(content.type);
+        const filters = [`id of it as string = ${JSON.stringify(String(content.bigfix_id || ""))}`];
+        const siteName = String(content.site_id || content.source_name || "");
+        if (siteName) filters.push(`name of site of it = ${JSON.stringify(siteName)}`);
+        const relevance = `(id of it as string, name of it | "", operating system of it | "", concatenation "," of ip addresses of it, last report time of it as string | "", if exists client version of it then client version of it as string else "", if active flag of it then "true" else "false") of applicable computers of ${objectType} whose (${filters.join(" and ")})`;
+        const resp = await bigfixRequest(console, `/query?relevance=${encodeURIComponent(relevance)}`, "GET");
+        const rows = parseTupleQueryXML(await resp.text());
+        const seen = new Set<string>();
+        const data = rows
+          .map(row => ({
+            id: row[0] || "",
+            console_id: consoleId,
+            bigfix_id: row[0] || "",
+            name: row[1] || row[0] || "",
+            os: row[2] || "",
+            ip_address: row[3] || "",
+            subnet: "",
+            last_report: row[4] || null,
+            is_online: row[6] === "true",
+            agent_version: row[5] || "",
+            custom_site_count: 0,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          }))
+          .filter(item => {
+            if (!item.bigfix_id || seen.has(item.bigfix_id)) return false;
+            seen.add(item.bigfix_id);
+            return true;
+          })
+          .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+        return jsonResponse({ data, count: data.length });
       }
 
       case "fetch-actions": {
