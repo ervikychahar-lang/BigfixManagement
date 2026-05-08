@@ -172,7 +172,7 @@ function normalizeDb(db) {
       failed_count: failed,
       running_count: running,
       not_run_count: pending,
-      status: running > 0 ? 'running' : failed > 0 ? 'failed' : completed === results.length ? 'completed' : action.status,
+      status: deriveActionStatusFromResults(results, action.status),
     };
   });
   return db;
@@ -180,12 +180,46 @@ function normalizeDb(db) {
 
 function normalizeResultStatus(status) {
   const value = String(status || '').toLowerCase();
-  if (value === 'fixed' || value === 'completed') return 'Completed';
-  if (value === 'failed' || value === 'error') return 'Failed';
-  if (value === 'running' || value === 'evaluating' || value === 'waiting') return 'Running';
-  if (value === 'notrun' || value === 'not run') return 'NotRun';
-  if (value === 'downloaded') return 'Downloaded';
+  if (!value) return 'Pending';
+  if (value.includes('failed') || value.includes('error')) return 'Failed';
+  if (value.includes('fixed') || value.includes('completed') || value.includes('complete')) return 'Completed';
+  if (value.includes('running') || value.includes('evaluating') || value.includes('waiting') || value.includes('active')) return 'Running';
+  if (value.includes('notrun') || value.includes('not run') || value.includes('not started') || value.includes('not relevant')) return 'NotRun';
+  if (value.includes('downloaded')) return 'Downloaded';
+  if (value.includes('pending') || value.includes('open')) return 'Pending';
   return status || 'Pending';
+}
+
+function deriveActionStatusFromResults(results, fallback = 'pending') {
+  const normalizedFallback = normalizeResultStatus(fallback);
+  if (results.length === 0) {
+    if (normalizedFallback === 'Failed') return 'failed';
+    if (normalizedFallback === 'Completed') return 'completed';
+    if (normalizedFallback === 'Running') return 'running';
+    if (normalizedFallback === 'NotRun' || normalizedFallback === 'Downloaded' || normalizedFallback === 'Pending') return 'pending';
+    return String(fallback || 'pending').toLowerCase();
+  }
+  const failed = results.filter(result => result.status === 'Failed').length;
+  const running = results.filter(result => result.status === 'Running').length;
+  const completed = results.filter(result => result.status === 'Completed').length;
+  const pending = results.filter(result => ['Pending', 'NotRun', 'Downloaded'].includes(result.status)).length;
+  if (running > 0 || pending > 0) return 'running';
+  if (failed > 0) return 'failed';
+  if (completed === results.length) return 'completed';
+  return deriveActionStatusFromResults([], fallback);
+}
+
+function deriveActionStatusFromSummary(action) {
+  const failed = parseInt(action.FailedCount, 10) || 0;
+  const running = parseInt(action.RunningCount, 10) || 0;
+  const completed = parseInt(action.CompletedCount, 10) || 0;
+  const notRun = parseInt(action.NotRunCount, 10) || 0;
+  const target = parseInt(action.TargetCount, 10) || 0;
+  if (running > 0) return 'running';
+  if (failed > 0) return 'failed';
+  if (target > 0 && completed === target) return 'completed';
+  if (notRun > 0 || target > 0) return 'pending';
+  return deriveActionStatusFromResults([], action.Status || 'pending');
 }
 
 function now() {
@@ -740,6 +774,69 @@ async function queryActionResults(consoleConfig, actionId) {
   }
 }
 
+async function fetchAndStoreActionStatus(db, consoleConfig, consoleId, actionBigfixId) {
+  let parsed = [];
+  try {
+    parsed = parseActionStatusXML(await bigfixRequest(consoleConfig, `/action/${actionBigfixId}/status`));
+  } catch (error) {
+    console.warn(`Action status REST failed for ${actionBigfixId}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (parsed.length === 0) {
+    parsed = await queryActionResults(consoleConfig, actionBigfixId);
+    if (parsed.length > 0) console.log(`Fetched ${parsed.length} action results by relevance fallback for ${actionBigfixId}`);
+  }
+
+  const action = db.bigfix_actions.find(item => item.console_id === consoleId && item.bigfix_id === actionBigfixId);
+  if (!action) return { count: parsed.length };
+
+  for (const result of parsed) {
+    let computer = db.bigfix_computers.find(item => item.console_id === consoleId && item.bigfix_id === result.ComputerID);
+    if (!computer && result.ComputerID) {
+      computer = {
+        id: randomUUID(),
+        console_id: consoleId,
+        bigfix_id: result.ComputerID,
+        name: result.ComputerName || result.ComputerID,
+        os: '',
+        ip_address: '',
+        subnet: '',
+        agent_version: '',
+        last_report: null,
+        is_online: false,
+        custom_site_count: 0,
+        created_at: now(),
+        updated_at: now(),
+      };
+      db.bigfix_computers.push(computer);
+    }
+    if (!computer) continue;
+    upsertBy(db, 'bigfix_action_results', item => item.action_id === action.id && item.computer_id === computer.id, {
+      action_id: action.id,
+      computer_id: computer.id,
+      status: normalizeResultStatus(result.Status || result.State),
+      state: result.State,
+      line_number: parseInt(result.LineNumber, 10) || 0,
+      result_code: result.ResultCode,
+      error_message: result.ErrorMessage,
+      log_excerpt: result.LogExcerpt,
+      retry_count: parseInt(result.RetryCount, 10) || 0,
+      started_at: result.StartedAt || null,
+      completed_at: result.CompletedAt || null,
+      updated_at: now(),
+    });
+  }
+
+  const storedResults = db.bigfix_action_results.filter(item => item.action_id === action.id);
+  action.completed_count = storedResults.filter(item => item.status === 'Completed').length;
+  action.failed_count = storedResults.filter(item => item.status === 'Failed').length;
+  action.running_count = storedResults.filter(item => item.status === 'Running').length;
+  action.not_run_count = storedResults.filter(item => ['NotRun', 'Pending', 'Downloaded'].includes(item.status)).length;
+  action.target_count = storedResults.length || parsed.length || action.target_count;
+  action.status = deriveActionStatusFromResults(storedResults, action.status);
+  action.updated_at = now();
+  return { count: parsed.length };
+}
+
 function sortByCreatedDesc(items) {
   return [...items].sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
 }
@@ -1209,7 +1306,7 @@ async function handleAction(body) {
           bigfix_id: action.ID,
           name: action.Name,
           type: action.Type || 'fixlet',
-          status: (action.Status || 'pending').toLowerCase(),
+          status: deriveActionStatusFromSummary(action),
           target_count: parseInt(action.TargetCount, 10) || 0,
           completed_count: parseInt(action.CompletedCount, 10) || 0,
           failed_count: parseInt(action.FailedCount, 10) || 0,
@@ -1221,6 +1318,7 @@ async function handleAction(body) {
           is_distributed: action.IsDistributed === 'true',
           updated_at: now(),
         });
+        await fetchAndStoreActionStatus(db, consoleConfig, body.consoleId, action.ID);
       }
       writeDb(db);
       return { success: true, count: parsed.length, message: `Synced ${parsed.length} actions` };
@@ -1228,61 +1326,9 @@ async function handleAction(body) {
 
     case 'fetch-action-status': {
       const consoleConfig = getConsole(db, body.consoleId);
-      let parsed = parseActionStatusXML(await bigfixRequest(consoleConfig, `/action/${body.actionBigfixId}/status`));
-      if (parsed.length === 0) {
-        parsed = await queryActionResults(consoleConfig, body.actionBigfixId);
-        console.log(`Fetched ${parsed.length} action results by relevance fallback`);
-      }
-      const action = db.bigfix_actions.find(item => item.console_id === body.consoleId && item.bigfix_id === body.actionBigfixId);
-      if (action) {
-        for (const result of parsed) {
-          let computer = db.bigfix_computers.find(item => item.console_id === body.consoleId && item.bigfix_id === result.ComputerID);
-          if (!computer && result.ComputerID) {
-            computer = {
-              id: randomUUID(),
-              console_id: body.consoleId,
-              bigfix_id: result.ComputerID,
-              name: result.ComputerName || result.ComputerID,
-              os: '',
-              ip_address: '',
-              subnet: '',
-              agent_version: '',
-              last_report: null,
-              is_online: false,
-              custom_site_count: 0,
-              created_at: now(),
-              updated_at: now(),
-            };
-            db.bigfix_computers.push(computer);
-          }
-          if (!computer) continue;
-          upsertBy(db, 'bigfix_action_results', item => item.action_id === action.id && item.computer_id === computer.id, {
-            action_id: action.id,
-            computer_id: computer.id,
-            status: normalizeResultStatus(result.Status),
-            state: result.State,
-            line_number: parseInt(result.LineNumber, 10) || 0,
-            result_code: result.ResultCode,
-            error_message: result.ErrorMessage,
-            log_excerpt: result.LogExcerpt,
-            retry_count: parseInt(result.RetryCount, 10) || 0,
-            started_at: result.StartedAt || null,
-            completed_at: result.CompletedAt || null,
-            updated_at: now(),
-          });
-        }
-        action.completed_count = parsed.filter(item => normalizeResultStatus(item.Status) === 'Completed').length;
-        action.failed_count = parsed.filter(item => normalizeResultStatus(item.Status) === 'Failed').length;
-        action.running_count = parsed.filter(item => normalizeResultStatus(item.Status) === 'Running').length;
-        action.not_run_count = parsed.filter(item => ['NotRun', 'Pending'].includes(normalizeResultStatus(item.Status))).length;
-        action.target_count = parsed.length || action.target_count;
-        if (parsed.length > 0) {
-          action.status = action.running_count > 0 ? 'running' : action.failed_count > 0 ? 'failed' : 'completed';
-        }
-        action.updated_at = now();
-      }
+      const result = await fetchAndStoreActionStatus(db, consoleConfig, body.consoleId, body.actionBigfixId);
       writeDb(db);
-      return { success: true, count: parsed.length, message: `Updated ${parsed.length} results` };
+      return { success: true, count: result.count, message: `Updated ${result.count} results` };
     }
 
     case 'deploy-action': {

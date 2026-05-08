@@ -85,6 +85,49 @@ function getXmlTag(block: string, tag: string) {
   return match ? cleanXmlText(match[1]) : "";
 }
 
+function normalizeResultStatus(status: unknown) {
+  const value = String(status || "").toLowerCase();
+  if (!value) return "Pending";
+  if (value.includes("failed") || value.includes("error")) return "Failed";
+  if (value.includes("fixed") || value.includes("completed") || value.includes("complete")) return "Completed";
+  if (value.includes("running") || value.includes("evaluating") || value.includes("waiting") || value.includes("active")) return "Running";
+  if (value.includes("notrun") || value.includes("not run") || value.includes("not started") || value.includes("not relevant")) return "NotRun";
+  if (value.includes("downloaded")) return "Downloaded";
+  if (value.includes("pending") || value.includes("open")) return "Pending";
+  return String(status || "Pending");
+}
+
+function deriveActionStatusFromResultStatuses(statuses: string[], fallback = "pending") {
+  if (statuses.length === 0) {
+    const normalized = normalizeResultStatus(fallback);
+    if (normalized === "Failed") return "failed";
+    if (normalized === "Completed") return "completed";
+    if (normalized === "Running") return "running";
+    return "pending";
+  }
+  const failed = statuses.filter(status => status === "Failed").length;
+  const running = statuses.filter(status => status === "Running").length;
+  const completed = statuses.filter(status => status === "Completed").length;
+  const pending = statuses.filter(status => ["Pending", "NotRun", "Downloaded"].includes(status)).length;
+  if (running > 0 || pending > 0) return "running";
+  if (failed > 0) return "failed";
+  if (completed === statuses.length) return "completed";
+  return "pending";
+}
+
+function deriveActionStatusFromSummary(action: Record<string, string>) {
+  const failed = parseInt(action.FailedCount) || 0;
+  const running = parseInt(action.RunningCount) || 0;
+  const completed = parseInt(action.CompletedCount) || 0;
+  const notRun = parseInt(action.NotRunCount) || 0;
+  const target = parseInt(action.TargetCount) || 0;
+  if (running > 0) return "running";
+  if (failed > 0) return "failed";
+  if (target > 0 && completed === target) return "completed";
+  if (notRun > 0 || target > 0) return "pending";
+  return deriveActionStatusFromResultStatuses([], action.Status || "pending");
+}
+
 async function bigfixRequest(console: BigFixConsoleConfig, path: string, method = "GET", body?: string) {
   const url = getBigFixUrl(console, path);
   const credentials = btoa(`${console.username}:${console.password_encrypted}`);
@@ -551,7 +594,7 @@ Deno.serve(async (req: Request) => {
             bigfix_id: act.ID,
             name: act.Name,
             type: act.Type,
-            status: act.Status.toLowerCase(),
+            status: deriveActionStatusFromSummary(act),
             target_count: parseInt(act.TargetCount) || 0,
             completed_count: parseInt(act.CompletedCount) || 0,
             failed_count: parseInt(act.FailedCount) || 0,
@@ -596,7 +639,7 @@ Deno.serve(async (req: Request) => {
               const record = {
                 action_id: actionData.data.id,
                 computer_id: compData.data.id,
-                status: res.Status,
+                status: normalizeResultStatus(res.Status || res.State),
                 state: res.State,
                 line_number: parseInt(res.LineNumber) || 0,
                 result_code: res.ResultCode,
@@ -616,17 +659,18 @@ Deno.serve(async (req: Request) => {
             }
           }
 
-          const completed = parsed.filter(r => r.Status === "Completed").length;
-          const failed = parsed.filter(r => r.Status === "Failed").length;
-          const running = parsed.filter(r => r.Status === "Running").length;
-          const notRun = parsed.filter(r => r.Status === "NotRun").length;
-          const allDone = running === 0 && parsed.length > 0;
+          const statuses = parsed.map(r => normalizeResultStatus(r.Status || r.State));
+          const completed = statuses.filter(status => status === "Completed").length;
+          const failed = statuses.filter(status => status === "Failed").length;
+          const running = statuses.filter(status => status === "Running").length;
+          const notRun = statuses.filter(status => ["NotRun", "Pending", "Downloaded"].includes(status)).length;
           await supabase.from("bigfix_actions").update({
             completed_count: completed,
             failed_count: failed,
             running_count: running,
             not_run_count: notRun,
-            status: allDone ? (failed > 0 ? "failed" : "completed") : "running",
+            target_count: parsed.length,
+            status: deriveActionStatusFromResultStatuses(statuses),
             updated_at: new Date().toISOString(),
           }).eq("id", actionData.data.id);
         }

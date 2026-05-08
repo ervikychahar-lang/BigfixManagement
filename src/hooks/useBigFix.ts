@@ -155,7 +155,9 @@ export function useActions(consoleId: string | null, status?: ActionStatus) {
 
   const fetchActionStatus = async (actionBigfixId: string) => {
     if (!consoleId) return;
-    return bigfixApi.fetchActionStatus(consoleId, actionBigfixId);
+    const result = await bigfixApi.fetchActionStatus(consoleId, actionBigfixId);
+    await fetch();
+    return result;
   };
 
   const stopAction = async (actionId: string) => {
