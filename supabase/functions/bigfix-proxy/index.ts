@@ -283,6 +283,79 @@ function generateActionScriptFromSteps(steps: string[], title = "Generated Auto-
   return lines.join("\n");
 }
 
+function proposeLogBasedResolution(result: Record<string, unknown>, bestResolution?: Record<string, unknown>) {
+  if (bestResolution) {
+    const steps = (bestResolution.resolution_steps as string[] | undefined) || [];
+    const type = String(bestResolution.resolution_type || "manual");
+    const script = String(bestResolution.resolution_script || "") || (type === "auto" ? generateActionScriptFromSteps(steps, String(bestResolution.title || "Generated Auto-Fix")) : "");
+    return {
+      title: bestResolution.title,
+      description: bestResolution.description,
+      type,
+      steps,
+      script,
+      resolutionId: bestResolution.id,
+      generatedScript: type === "auto" && !bestResolution.resolution_script,
+    };
+  }
+
+  const text = `${result.result_code || ""} ${result.error_message || ""} ${result.log_excerpt || ""} ${result.state || ""}`.toLowerCase();
+  let title = "Manual log-based remediation";
+  let description = "Generated from the failed action log evidence. Review the captured log detail before redeploying.";
+  let type = "manual";
+  let steps = [
+    "Review the captured log line and result code for the exact failing operation.",
+    "Fix the endpoint or package condition identified in the log evidence.",
+    "Redeploy the original action after remediation.",
+  ];
+
+  if (/besclient|client service|agent.*stuck|not responding|relay autoselection|relay selection/.test(text)) {
+    title = "Restart BigFix Client and retry";
+    description = "The log evidence points to a stuck client or relay-processing condition.";
+    type = "auto";
+    steps = ["Restart the BESClient service on the affected endpoint.", "Wait for the client to report back.", "Redeploy the original action."];
+  } else if (/download|prefetch|hash|sha1|sha256|size mismatch|relay cache/.test(text)) {
+    title = "Clear BigFix download cache and retry";
+    description = "The log evidence points to a download, prefetch, or hash-verification failure.";
+    type = "auto";
+    steps = ["Clear the BigFix action download cache.", "Force the endpoint to download a fresh payload from its relay.", "Redeploy the original action."];
+  } else if (/temp|temporary/.test(text) && /disk|space|storage/.test(text)) {
+    title = "Clean temporary files and retry";
+    description = "The log evidence points to temporary storage pressure.";
+    type = "auto";
+    steps = ["Clean Windows temporary files.", "Confirm the endpoint can report back.", "Redeploy the original action."];
+  } else if (/disk|space|not enough storage|insufficient/.test(text)) {
+    title = "Free endpoint disk space";
+    description = "The log evidence points to insufficient disk space. Keep this manual unless automated cleanup is approved.";
+    steps = ["Check free space on the system and BigFix client drives.", "Remove stale payloads or expand disk capacity.", "Redeploy after enough free space is available."];
+  } else if (/1618|another installation|msiexec/.test(text)) {
+    title = "Wait for active installer and retry";
+    description = "The log evidence points to another Windows Installer transaction.";
+    steps = ["Check for active msiexec.exe or installation activity.", "Wait for it to finish or reboot if it is stuck.", "Redeploy the original action."];
+  } else if (/1603|fatal error during installation|msi.*fatal/.test(text)) {
+    title = "Investigate MSI fatal install condition";
+    description = "The log evidence points to MSI error 1603, which usually needs package or endpoint validation.";
+    steps = ["Check the failing MSI command and vendor log around the captured line.", "Verify prerequisites, pending reboot, permissions, and locked files.", "Fix the package condition and redeploy."];
+  } else if (/locked/.test(text)) {
+    title = "Unlock endpoint for actions";
+    description = "The log evidence says the endpoint is locked for actions.";
+    steps = ["Confirm the endpoint lock state in BigFix.", "Unlock the endpoint or adjust the locking policy.", "Redeploy the original action."];
+  } else if (/timeout|timed out|unreachable|connection/.test(text)) {
+    title = "Restore endpoint or relay connectivity";
+    description = "The log evidence points to connectivity or timeout.";
+    steps = ["Confirm the endpoint is online and reporting.", "Check relay connectivity and firewall path.", "Redeploy after the endpoint reports successfully."];
+  }
+
+  return {
+    title,
+    description,
+    type,
+    steps,
+    script: type === "auto" ? generateActionScriptFromSteps(steps, title) : "",
+    generatedScript: true,
+  };
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -604,9 +677,8 @@ ${targetXml}
           });
 
           const bestResolution = matchingResolutions[0];
-          const steps = (bestResolution?.resolution_steps as string[] | undefined) || ["Verify the endpoint is online", "Review the captured action log detail", "Redeploy the original action after remediation"];
-          const script = String(bestResolution?.resolution_script || "") || generateActionScriptFromSteps(steps, String(bestResolution?.title || "Generated endpoint remediation"));
           return {
+            actionResultId: result.id,
             computerId: computer?.bigfix_id || "",
             computerName: computer?.name || "Unknown",
             status: result.result_code || "ERROR",
@@ -615,22 +687,7 @@ ${targetXml}
             lineNumber: result.line_number || 0,
             logExcerpt: result.log_excerpt || "",
             retryCount: result.retry_count || 0,
-            proposedResolution: bestResolution ? {
-              title: bestResolution.title,
-              description: bestResolution.description,
-              type: bestResolution.resolution_type,
-              steps,
-              script,
-              resolutionId: bestResolution.id,
-              generatedScript: !bestResolution.resolution_script,
-            } : {
-              title: "Generated endpoint remediation",
-              description: "Built from the failed action status/log detail captured from BigFix.",
-              type: "auto",
-              steps,
-              script,
-              generatedScript: true,
-            },
+            proposedResolution: proposeLogBasedResolution(result, bestResolution),
           };
         });
 

@@ -858,12 +858,58 @@ function proposedResolutionForFailure(resolution, diagnosis) {
     };
   }
 
-  const steps = ['Verify the endpoint is online', 'Review the captured action log detail', 'Redeploy the original action after remediation'];
-  const script = generateActionScriptFromSteps(steps, diagnosis, 'Generated endpoint remediation');
+  const text = `${diagnosis?.rootCause || ''} ${diagnosis?.detail || ''} ${(diagnosis?.evidence || []).join(' ')}`.toLowerCase();
+  let title = 'Manual log-based remediation';
+  let description = 'Generated from the failed action log evidence. Review the captured log detail before redeploying.';
+  let type = 'manual';
+  let steps = [
+    'Review the captured log line and result code for the exact failing operation.',
+    'Fix the endpoint or package condition identified in the log evidence.',
+    'Redeploy the original action after remediation.',
+  ];
+
+  if (/besclient|client service|agent.*stuck|not responding|relay autoselection|relay selection/.test(text)) {
+    title = 'Restart BigFix Client and retry';
+    description = 'The log evidence points to a stuck client/relay-processing condition. This can be remediated automatically by restarting the BESClient service before redeploy.';
+    type = 'auto';
+    steps = ['Restart the BESClient service on the affected endpoint.', 'Wait for the client to report back.', 'Redeploy the original action.'];
+  } else if (/download|prefetch|hash|sha1|sha256|size mismatch|relay cache/.test(text)) {
+    title = 'Clear BigFix download cache and retry';
+    description = 'The log evidence points to a download, prefetch, or hash-verification failure. This can be remediated automatically by clearing the action download cache before redeploy.';
+    type = 'auto';
+    steps = ['Clear the BigFix action download cache.', 'Force the endpoint to download a fresh payload from its relay.', 'Redeploy the original action.'];
+  } else if (/temp|temporary/.test(text) && /disk|space|storage/.test(text)) {
+    title = 'Clean temporary files and retry';
+    description = 'The log evidence points to temporary storage pressure. This can be remediated automatically by clearing Windows temp files before redeploy.';
+    type = 'auto';
+    steps = ['Clean Windows temporary files.', 'Confirm the endpoint can report back.', 'Redeploy the original action.'];
+  } else if (/disk|space|not enough storage|insufficient/.test(text)) {
+    title = 'Free endpoint disk space';
+    description = 'The log evidence points to insufficient disk space. Keep this manual unless your environment allows automated cleanup beyond temporary files.';
+    steps = ['Check free space on the system and BigFix client drives.', 'Remove stale payloads or expand disk capacity.', 'Redeploy after enough free space is available.'];
+  } else if (/1618|another msi installation|msiexec/.test(text)) {
+    title = 'Wait for active installer and retry';
+    description = 'The log evidence points to another Windows Installer transaction. Manual confirmation is safer before redeploying.';
+    steps = ['Check for active msiexec.exe or software installation activity.', 'Wait for the installer to finish or reboot if it is stuck.', 'Redeploy the original action.'];
+  } else if (/1603|msi fatal|fatal installation/.test(text)) {
+    title = 'Investigate MSI fatal install condition';
+    description = 'The log evidence points to MSI error 1603. This is usually package or endpoint state specific, so manual validation is required.';
+    steps = ['Check the failing MSI command and vendor log around the captured line.', 'Verify prerequisites, pending reboot, permissions, and locked files.', 'Fix the package condition and redeploy.'];
+  } else if (/locked/.test(text)) {
+    title = 'Unlock endpoint for actions';
+    description = 'The log evidence says the endpoint is locked for actions. Unlock it before redeploying.';
+    steps = ['Confirm the endpoint lock state in BigFix.', 'Unlock the endpoint or adjust the locking policy.', 'Redeploy the original action.'];
+  } else if (/timeout|timed out|unreachable|connection/.test(text)) {
+    title = 'Restore endpoint or relay connectivity';
+    description = 'The log evidence points to connectivity or timeout. Manual network/client validation is required before redeploy.';
+    steps = ['Confirm the endpoint is online and reporting.', 'Check relay connectivity and firewall path.', 'Redeploy after the endpoint reports successfully.'];
+  }
+
+  const script = type === 'auto' ? generateActionScriptFromSteps(steps, diagnosis, title) : '';
   return {
-    title: 'Generated endpoint remediation',
-    description: 'Built from the failed action status/log detail captured from BigFix.',
-    type: 'auto',
+    title,
+    description,
+    type,
     steps,
     script,
     generatedScript: true,
@@ -1257,6 +1303,7 @@ ${targetXml}
         const resolution = matchResolution(db.bigfix_failure_resolutions, result);
         const diagnosis = diagnoseFailure(result, computer, action, resolution);
         return {
+          actionResultId: result.id,
           computerId: computer?.bigfix_id || '',
           computerName: computer?.name || 'Unknown',
           status: result.result_code || result.error_message || 'ERROR',

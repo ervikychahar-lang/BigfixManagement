@@ -218,6 +218,7 @@ export interface BigFixAppliedResolution {
 }
 
 export interface AnalysisResult {
+  actionResultId?: string;
   computerId: string;
   computerName: string;
   status: string;

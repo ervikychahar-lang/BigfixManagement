@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect } from 'react';
 import { useActions, useConsoles, useActionResults } from '../hooks/useBigFix';
 import { Activity, RefreshCw, Play, Square, Filter, Clock, CheckCircle, XCircle, AlertCircle, Eye, Zap, Search, RotateCcw } from 'lucide-react';
 import type { ActionStatus, BigFixAction, AnalysisResult } from '../lib/api';
+import { bigfixApi } from '../lib/api';
 
 const STATUS_STYLES: Record<string, { bg: string; text: string; icon: typeof Clock }> = {
   pending: { bg: 'bg-gray-100', text: 'text-gray-600', icon: Clock },
@@ -34,6 +35,7 @@ export default function Actions() {
   const [analyzing, setAnalyzing] = useState<string | null>(null);
   const [analysisData, setAnalysisData] = useState<Record<string, { analysis: AnalysisResult[]; failedComputers: number; totalComputers: number; actionName: string }>>({});
   const [redeploying, setRedeploying] = useState<string | null>(null);
+  const [applyingGenerated, setApplyingGenerated] = useState<string | null>(null);
   const { results, loading: resultsLoading } = useActionResults(expandedAction);
 
   useEffect(() => {
@@ -81,6 +83,16 @@ export default function Actions() {
   const handleRedeploy = async (action: BigFixAction) => {
     setRedeploying(action.id);
     try { await redeployAction(action.id); } catch (e) { console.error(e); } finally { setRedeploying(null); }
+  };
+
+  const handleApplyGeneratedFix = async (analysis: AnalysisResult) => {
+    if (!consoleId || !analysis.actionResultId || !analysis.proposedResolution?.script?.trim()) return;
+    if (!window.confirm('Auto-Fix script deploy hoga, uske baad original failed action redeploy hoga. Continue?')) return;
+    setApplyingGenerated(analysis.actionResultId);
+    try {
+      await bigfixApi.applyGeneratedFix(consoleId, analysis.actionResultId, analysis.proposedResolution, true);
+      await syncFromConsole();
+    } catch (e) { console.error(e); } finally { setApplyingGenerated(null); }
   };
 
   const sorted = useMemo(() => {
@@ -283,7 +295,17 @@ export default function Actions() {
                                 </ol>
                               )}
                               {ar.proposedResolution.type === 'auto' && ar.proposedResolution.script && (
-                                <pre className="mt-2 p-2 bg-gray-800 text-green-400 rounded text-xs font-mono overflow-x-auto">{ar.proposedResolution.script}</pre>
+                                <>
+                                  <pre className="mt-2 p-2 bg-gray-800 text-green-400 rounded text-xs font-mono overflow-x-auto">{ar.proposedResolution.script}</pre>
+                                  <div className="mt-2 flex justify-end">
+                                    <button onClick={() => handleApplyGeneratedFix(ar)}
+                                      disabled={!ar.actionResultId || applyingGenerated === ar.actionResultId}
+                                      className="flex items-center gap-1 px-3 py-1.5 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50 transition-colors text-xs font-medium">
+                                      <Zap className="w-3 h-3" />
+                                      {applyingGenerated === ar.actionResultId ? 'Deploying...' : 'Confirm Auto-Fix & Redeploy'}
+                                    </button>
+                                  </div>
+                                </>
                               )}
                             </div>
                           )}
