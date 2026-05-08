@@ -55,12 +55,12 @@ export default function ResolutionLibrary() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Resolution Library</h1>
-          <p className="text-sm text-gray-500 mt-1">{resolutions.length} resolutions | {resolutions.filter(r => r.resolution_type === 'auto').length} auto-fix | {resolutions.filter(r => r.is_verified).length} verified</p>
+          <h1 className="text-2xl font-bold text-gray-900">Knowledge Base</h1>
+          <p className="text-sm text-gray-500 mt-1">{resolutions.length} learned resolutions | {resolutions.filter(r => r.resolution_type === 'auto').length} auto-fix | {resolutions.filter(r => r.is_verified).length} verified</p>
         </div>
         <button onClick={() => { setShowAdd(true); resetForm(); }}
           className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium">
-          <Plus className="w-4 h-4" /> Add Resolution
+          <Plus className="w-4 h-4" /> Train Resolution
         </button>
       </div>
 
@@ -89,8 +89,8 @@ export default function ResolutionLibrary() {
       ) : filtered.length === 0 ? (
         <div className="text-center py-20 text-gray-500">
           <BookOpen className="w-12 h-12 mx-auto mb-3 text-gray-300" />
-          <p className="text-lg font-medium">No resolutions found</p>
-          <p className="text-sm mt-1">Add resolutions to build your fix library.</p>
+          <p className="text-lg font-medium">No knowledge entries found</p>
+          <p className="text-sm mt-1">Train the tool with known errors and manual or auto fixes.</p>
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -161,7 +161,7 @@ export default function ResolutionLibrary() {
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-xl shadow-xl max-w-lg w-full max-h-[80vh] overflow-auto">
             <div className="p-6 border-b border-gray-200 flex items-center justify-between">
-              <h2 className="text-lg font-semibold text-gray-900">{editing ? 'Edit Resolution' : 'Add Resolution'}</h2>
+              <h2 className="text-lg font-semibold text-gray-900">{editing ? 'Edit Knowledge Entry' : 'Train Knowledge Entry'}</h2>
               <button onClick={() => { setShowAdd(false); setEditing(null); resetForm(); }}><X className="w-5 h-5 text-gray-400" /></button>
             </div>
             <div className="p-6 space-y-4">

@@ -1,29 +1,69 @@
 import { supabase } from './supabase';
 
-const FUNCTION_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/bigfix-proxy`;
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const configuredProxyUrl = import.meta.env.VITE_BIGFIX_PROXY_URL;
+const functionUrl = configuredProxyUrl
+  ? configuredProxyUrl.replace(/\/$/, '')
+  : supabaseUrl ? `${supabaseUrl.replace(/\/$/, '')}/functions/v1/bigfix-proxy` : '';
 
 async function callEdgeFunction(action: string, payload: Record<string, unknown>) {
-  const { data: { session } } = await supabase.auth.getSession();
-  const token = session?.access_token || import.meta.env.VITE_SUPABASE_ANON_KEY;
+  if (!functionUrl) {
+    throw new Error('Missing Supabase URL. Set VITE_SUPABASE_URL.');
+  }
 
-  const response = await fetch(FUNCTION_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`,
-    },
-    body: JSON.stringify({ action, ...payload }),
-  });
+  const sessionResult = supabase ? await supabase.auth.getSession() : null;
+  const token = sessionResult?.data.session?.access_token || import.meta.env.VITE_SUPABASE_ANON_KEY || 'local';
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 60000);
 
-  const result = await response.json();
-  if (!response.ok) throw new Error(result.error || 'Edge function error');
-  return result;
+  try {
+    const response = await fetch(functionUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({ action, ...payload }),
+      signal: controller.signal,
+    });
+
+    const text = await response.text();
+    const result = text ? JSON.parse(text) : {};
+    if (!response.ok) throw new Error(result.error || `Edge function returned ${response.status}`);
+    return result;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('Connection timed out after 60 seconds. Check BigFix reachability and firewall rules.');
+    }
+    if (error instanceof SyntaxError) {
+      throw new Error('Edge function returned an invalid response. Check Supabase function logs.');
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 export const bigfixApi = {
+  listConsoles: () => callEdgeFunction('list-consoles', {}),
+  addConsole: (console: Record<string, unknown>) => callEdgeFunction('add-console', { console }),
+  updateConsole: (id: string, updates: Record<string, unknown>) => callEdgeFunction('update-console', { id, updates }),
+  deleteConsole: (id: string) => callEdgeFunction('delete-console', { id }),
+  listComputers: (consoleId: string) => callEdgeFunction('list-computers', { consoleId }),
+  listContent: (consoleId: string, type?: string, siteId?: string) => callEdgeFunction('list-content', { consoleId, type, siteId }),
+  listActions: (consoleId: string, status?: string) => callEdgeFunction('list-actions', { consoleId, status }),
+  listActionResults: (actionId: string) => callEdgeFunction('list-action-results', { actionId }),
+  listFailedResults: (consoleId: string) => callEdgeFunction('list-failed-results', { consoleId }),
+  listResolutions: () => callEdgeFunction('list-resolutions', {}),
+  addResolution: (resolution: Record<string, unknown>) => callEdgeFunction('add-resolution', { resolution }),
+  updateResolution: (id: string, updates: Record<string, unknown>) => callEdgeFunction('update-resolution', { id, updates }),
+  deleteResolution: (id: string) => callEdgeFunction('delete-resolution', { id }),
+  listAppliedResolutions: (actionResultId: string) => callEdgeFunction('list-applied-resolutions', { actionResultId }),
+  dashboardStats: (consoleId: string) => callEdgeFunction('dashboard-stats', { consoleId }),
+  listSites: (consoleId: string) => callEdgeFunction('list-sites', { consoleId }),
   testConnection: (consoleId: string) => callEdgeFunction('test-connection', { consoleId }),
   fetchComputers: (consoleId: string) => callEdgeFunction('fetch-computers', { consoleId }),
-  fetchContent: (consoleId: string, type: string) => callEdgeFunction('fetch-content', { consoleId, type }),
+  fetchContent: (consoleId: string, type: string, siteId?: string) => callEdgeFunction('fetch-content', { consoleId, type, siteId }),
   deployAction: (consoleId: string, contentId: string, targetComputerIds: string[], actionName?: string) =>
     callEdgeFunction('deploy-action', { consoleId, contentId, targetComputerIds, actionName }),
   fetchActions: (consoleId: string) => callEdgeFunction('fetch-actions', { consoleId }),
@@ -31,8 +71,10 @@ export const bigfixApi = {
     callEdgeFunction('fetch-action-status', { consoleId, actionBigfixId }),
   stopAction: (consoleId: string, actionId: string) => callEdgeFunction('stop-action', { consoleId, actionId }),
   analyzeFailures: (consoleId: string, actionId: string) => callEdgeFunction('analyze-failures', { consoleId, actionId }),
-  applyFix: (consoleId: string, actionResultId: string, resolutionId: string, appliedBy: string) =>
-    callEdgeFunction('apply-fix', { consoleId, actionResultId, resolutionId, appliedBy }),
+  applyFix: (consoleId: string, actionResultId: string, resolutionId: string, appliedBy: string, redeployAfterFix = false) =>
+    callEdgeFunction('apply-fix', { consoleId, actionResultId, resolutionId, appliedBy, redeployAfterFix }),
+  applyGeneratedFix: (consoleId: string, actionResultId: string, proposedResolution: Record<string, unknown>, redeployAfterFix = true) =>
+    callEdgeFunction('apply-generated-fix', { consoleId, actionResultId, proposedResolution, redeployAfterFix }),
   redeployAction: (consoleId: string, actionId: string) => callEdgeFunction('redeploy-action', { consoleId, actionId }),
   fetchSites: (consoleId: string) => callEdgeFunction('fetch-sites', { consoleId }),
 };
@@ -69,8 +111,18 @@ export interface BigFixComputer {
   is_online: boolean;
   agent_version: string;
   custom_site_count: number;
+  sites?: string[];
   created_at: string;
   updated_at: string;
+}
+
+export interface BigFixSite {
+  id: string;
+  console_id: string;
+  name: string;
+  display_name: string;
+  type: string;
+  created_at: string;
 }
 
 export interface BigFixContent {
@@ -89,6 +141,7 @@ export interface BigFixContent {
   action_script: string;
   is_applicable_count: number;
   is_enabled: boolean;
+  is_hidden?: boolean;
   metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;
@@ -123,13 +176,16 @@ export interface BigFixActionResult {
   status: ResultStatus;
   result_code: string;
   error_message: string;
+  log_excerpt?: string;
+  line_number?: number;
+  state?: string;
   retry_count: number;
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
   updated_at: string;
   bigfix_computers?: Pick<BigFixComputer, 'name' | 'os' | 'ip_address' | 'bigfix_id'>;
-  bigfix_actions?: Pick<BigFixAction, 'name' | 'type' | 'status' | 'bigfix_id' | 'console_id'>;
+  bigfix_actions?: Pick<BigFixAction, 'name' | 'type' | 'status' | 'bigfix_id' | 'console_id' | 'created_by' | 'start_time'>;
 }
 
 export interface BigFixFailureResolution {
@@ -168,12 +224,20 @@ export interface AnalysisResult {
   isError: boolean;
   state: string;
   lineNumber: number;
+  logExcerpt?: string;
   retryCount: number;
+  rootCause?: string;
+  confidence?: string;
+  evidence?: string[];
+  detail?: string;
+  computerOnline?: boolean;
   proposedResolution: {
     title: string;
     description: string;
     type: string;
     steps: string[];
     script: string;
+    resolutionId?: string;
+    generatedScript?: boolean;
   } | null;
 }

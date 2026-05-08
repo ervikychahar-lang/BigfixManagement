@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
-import { useContent, useConsoles, useComputers } from '../hooks/useBigFix';
-import { Shield, Wrench, Layers, Bug, Search, RefreshCw, Play, ChevronDown, ChevronUp, Filter } from 'lucide-react';
+import { useContent, useConsoles, useComputers, useSites } from '../hooks/useBigFix';
+import { Shield, Wrench, Layers, Bug, Search, RefreshCw, Play, ChevronDown, ChevronUp, Filter, EyeOff, ListFilter } from 'lucide-react';
 import type { ContentType, BigFixContent, ContentSeverity } from '../lib/api';
 
 const TYPE_CONFIG: Record<ContentType, { label: string; icon: typeof Shield; color: string; bg: string; border: string }> = {
@@ -22,11 +22,15 @@ export default function ContentManager() {
   const defaultConsole = consoles.find(c => c.is_default) || consoles[0];
   const consoleId = defaultConsole?.id || null;
   const [activeType, setActiveType] = useState<ContentType>('fixlet');
-  const { items, loading, syncFromConsole, deployAction } = useContent(consoleId, activeType);
+  const [selectedSite, setSelectedSite] = useState('all');
+  const { sites, syncFromConsole: syncSites } = useSites(consoleId);
+  const { items, loading, syncFromConsole, deployAction } = useContent(consoleId, activeType, selectedSite);
   const { computers } = useComputers(consoleId);
   const [syncing, setSyncing] = useState(false);
   const [search, setSearch] = useState('');
   const [severityFilter, setSeverityFilter] = useState<ContentSeverity | 'all'>('all');
+  const [showHiddenContent, setShowHiddenContent] = useState(false);
+  const [showNonRelevantContent, setShowNonRelevantContent] = useState(false);
   const [sortField, setSortField] = useState<'name' | 'severity' | 'is_applicable_count'>('name');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
   const [applying, setApplying] = useState<string | null>(null);
@@ -36,11 +40,16 @@ export default function ContentManager() {
 
   const handleSync = async () => {
     setSyncing(true);
-    try { await syncFromConsole(activeType); } catch (e) { console.error(e); } finally { setSyncing(false); }
+    try {
+      await syncSites();
+      await syncFromConsole(activeType, selectedSite === 'all' ? undefined : selectedSite);
+    } catch (e) { console.error(e); } finally { setSyncing(false); }
   };
 
   const filtered = useMemo(() => {
     let list = [...items];
+    if (!showHiddenContent) list = list.filter(c => !c.is_hidden);
+    if (!showNonRelevantContent) list = list.filter(c => c.is_applicable_count > 0);
     if (search) {
       const q = search.toLowerCase();
       list = list.filter(c => c.name.toLowerCase().includes(q) || c.description.toLowerCase().includes(q) || c.category.toLowerCase().includes(q) || c.source_name.toLowerCase().includes(q));
@@ -52,7 +61,7 @@ export default function ContentManager() {
       return sortDir === 'asc' ? cmp : -cmp;
     });
     return list;
-  }, [items, search, severityFilter, sortField, sortDir]);
+  }, [items, showHiddenContent, showNonRelevantContent, search, severityFilter, sortField, sortDir]);
 
   const toggleSort = (field: typeof sortField) => {
     if (sortField === field) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -119,6 +128,20 @@ export default function ContentManager() {
       </div>
 
       <div className="flex flex-col sm:flex-row gap-3">
+        <select value={selectedSite} onChange={e => setSelectedSite(e.target.value)}
+          className="px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white min-w-64">
+          <option value="all">All Sites</option>
+          {sites.map(site => (
+            <option key={site.id} value={site.name}>{site.display_name || site.name} ({site.type})</option>
+          ))}
+        </select>
+        <button onClick={syncSites} disabled={!consoleId}
+          className="px-3 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 disabled:opacity-50 transition-colors text-sm font-medium border border-gray-200">
+          Refresh Sites
+        </button>
+      </div>
+
+      <div className="flex flex-col sm:flex-row gap-3">
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
           <input type="text" placeholder={`Search ${typeConfig.label.toLowerCase()}...`} value={search} onChange={e => setSearch(e.target.value)}
@@ -135,6 +158,24 @@ export default function ContentManager() {
             </button>
           ))}
         </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <button onClick={() => setShowHiddenContent(v => !v)}
+          className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium border transition-colors ${
+            showHiddenContent ? 'bg-slate-700 text-white border-slate-700' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'
+          }`}>
+          <EyeOff className="w-3.5 h-3.5" />
+          Hidden Content
+        </button>
+        <button onClick={() => setShowNonRelevantContent(v => !v)}
+          className={`flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium border transition-colors ${
+            showNonRelevantContent ? 'bg-slate-700 text-white border-slate-700' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'
+          }`}>
+          <ListFilter className="w-3.5 h-3.5" />
+          Non-Relevant Content
+        </button>
+        <span className="text-xs text-gray-500">{filtered.length} shown of {items.length} synced</span>
       </div>
 
       {loading ? (
@@ -179,7 +220,10 @@ export default function ContentManager() {
                         <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${sev.bg} ${sev.text}`}>{item.severity}</span>
                       </td>
                       <td className="px-4 py-3 text-gray-600">{item.is_applicable_count}</td>
-                      <td className="px-4 py-3 text-gray-600 text-xs">{item.source_name || item.site_id || '-'}</td>
+                      <td className="px-4 py-3 text-gray-600 text-xs">
+                        <div>{item.source_name || item.site_id || '-'}</div>
+                        {item.is_hidden && <span className="inline-flex mt-1 px-1.5 py-0.5 bg-gray-100 text-gray-500 rounded text-[10px] font-medium">hidden</span>}
+                      </td>
                       <td className="px-4 py-3">
                         <button onClick={() => { setShowApplyModal(item); setSelectedComputers(new Set()); setActionName(''); }}
                           className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-xs font-medium">

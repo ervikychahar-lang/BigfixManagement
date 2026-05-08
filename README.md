@@ -51,6 +51,29 @@ Frontend (React)  -->  Supabase Edge Function  -->  BigFix REST API
    ```
 5. Go to **Settings** and add your BigFix console connection details (host, port, username, password)
 
+## Local / Internal BigFix Proxy
+
+Use this mode when BigFix is on a private IP such as `192.168.x.x` and should not be called from Supabase cloud.
+
+Create `.env.local` using `.env.local.example` as the template, then set:
+
+```bash
+VITE_BIGFIX_PROXY_URL=http://127.0.0.1:8787
+BIGFIX_PROXY_HOST=127.0.0.1
+BIGFIX_PROXY_PORT=8787
+BIGFIX_LOCAL_DB=data/local-db.json
+BIGFIX_TLS_REJECT_UNAUTHORIZED=false
+```
+
+Run the proxy and app in two terminals:
+
+```bash
+npm run proxy:local
+npm run dev:local
+```
+
+For company testing, deploy `server/local-bigfix-proxy.mjs` on an internal server that can reach BigFix, set `BIGFIX_PROXY_HOST=0.0.0.0`, use a trusted TLS certificate, set `BIGFIX_TLS_REJECT_UNAUTHORIZED=true`, and point `VITE_BIGFIX_PROXY_URL` to that internal proxy URL.
+
 ## BigFix Console Connection
 
 The tool connects to your BigFix server via the REST API:

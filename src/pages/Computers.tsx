@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react';
-import { useComputers, useConsoles } from '../hooks/useBigFix';
+import { useComputers, useConsoles, useSites } from '../hooks/useBigFix';
 import { Monitor, Search, RefreshCw, Wifi, WifiOff, ChevronDown, ChevronUp, Filter } from 'lucide-react';
 import type { BigFixComputer } from '../lib/api';
 
@@ -8,7 +8,9 @@ export default function Computers() {
   const defaultConsole = consoles.find(c => c.is_default) || consoles[0];
   const consoleId = defaultConsole?.id || null;
   const { computers, loading, syncFromConsole } = useComputers(consoleId);
+  const { sites, syncFromConsole: syncSites } = useSites(consoleId);
   const [syncing, setSyncing] = useState(false);
+  const [selectedSite, setSelectedSite] = useState('all');
   const [search, setSearch] = useState('');
   const [filterOnline, setFilterOnline] = useState<'all' | 'online' | 'offline'>('all');
   const [sortField, setSortField] = useState<keyof BigFixComputer>('name');
@@ -16,7 +18,7 @@ export default function Computers() {
 
   const handleSync = async () => {
     setSyncing(true);
-    try { await syncFromConsole(); } catch (e) { console.error(e); } finally { setSyncing(false); }
+    try { await syncSites(); await syncFromConsole(); } catch (e) { console.error(e); } finally { setSyncing(false); }
   };
 
   const filtered = useMemo(() => {
@@ -27,6 +29,7 @@ export default function Computers() {
     }
     if (filterOnline === 'online') list = list.filter(c => c.is_online);
     else if (filterOnline === 'offline') list = list.filter(c => !c.is_online);
+    if (selectedSite !== 'all') list = list.filter(c => !c.sites || c.sites.length === 0 || c.sites.includes(selectedSite));
     list.sort((a, b) => {
       const aVal = a[sortField] ?? '';
       const bVal = b[sortField] ?? '';
@@ -34,7 +37,7 @@ export default function Computers() {
       return sortDir === 'asc' ? cmp : -cmp;
     });
     return list;
-  }, [computers, search, filterOnline, sortField, sortDir]);
+  }, [computers, search, filterOnline, selectedSite, sortField, sortDir]);
 
   const toggleSort = (field: keyof BigFixComputer) => {
     if (sortField === field) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -63,6 +66,13 @@ export default function Computers() {
       </div>
 
       <div className="flex flex-col sm:flex-row gap-3">
+        <select value={selectedSite} onChange={e => setSelectedSite(e.target.value)}
+          className="px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white min-w-56">
+          <option value="all">All Sites</option>
+          {sites.map(site => (
+            <option key={site.id} value={site.name}>{site.display_name || site.name}</option>
+          ))}
+        </select>
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
           <input type="text" placeholder="Search by name, OS, IP, or BigFix ID..." value={search} onChange={e => setSearch(e.target.value)}

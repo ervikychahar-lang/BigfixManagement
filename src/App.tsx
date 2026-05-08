@@ -16,7 +16,7 @@ const NAV_ITEMS: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'content', label: 'Content', icon: Shield },
   { id: 'actions', label: 'Actions', icon: Activity },
   { id: 'failures', label: 'Failures', icon: AlertTriangle },
-  { id: 'resolutions', label: 'Resolutions', icon: BookOpen },
+  { id: 'resolutions', label: 'Knowledge Base', icon: BookOpen },
   { id: 'settings', label: 'Settings', icon: Settings },
 ];
 

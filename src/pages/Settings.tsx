@@ -6,6 +6,8 @@ export default function Settings() {
   const { consoles, loading, addConsole, updateConsole, deleteConsole, testConnection } = useConsoles();
   const [showAdd, setShowAdd] = useState(false);
   const [testing, setTesting] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [addError, setAddError] = useState('');
   const [testResult, setTestResult] = useState<Record<string, { success: boolean; message: string; serverVersion?: string }>>({});
   const [form, setForm] = useState({
     name: '', host: '', port: 52311, username: '', password_encrypted: '', is_default: false,
@@ -14,9 +16,22 @@ export default function Settings() {
   const resetForm = () => setForm({ name: '', host: '', port: 52311, username: '', password_encrypted: '', is_default: false });
 
   const handleAdd = async () => {
-    await addConsole(form);
-    setShowAdd(false);
-    resetForm();
+    setSaving(true);
+    setAddError('');
+    try {
+      await addConsole({
+        ...form,
+        name: form.name.trim(),
+        host: form.host.trim().replace(/^https?:\/\//i, '').replace(/\/api\/?$/i, '').replace(/\/$/, ''),
+        username: form.username.trim(),
+      });
+      setShowAdd(false);
+      resetForm();
+    } catch (error) {
+      setAddError(error instanceof Error ? error.message : 'Failed to add console');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleTest = async (id: string) => {
@@ -44,7 +59,7 @@ export default function Settings() {
           <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
           <p className="text-sm text-gray-500 mt-1">Manage BigFix console connections (REST API on port 52311)</p>
         </div>
-        <button onClick={() => { setShowAdd(true); resetForm(); }}
+        <button onClick={() => { setShowAdd(true); resetForm(); setAddError(''); }}
           className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium">
           <Plus className="w-4 h-4" /> Add Console
         </button>
@@ -55,7 +70,7 @@ export default function Settings() {
         <p className="text-xs text-blue-700 leading-relaxed">
           Connect to your HCL BigFix server using the REST API. The default port is <strong>52311</strong> (HTTPS).
           The tool authenticates using your BigFix Console operator credentials via HTTP Basic Auth.
-          Make sure the REST API is enabled on your BigFix server and your operator has the necessary permissions.
+          Make sure the REST API is enabled, the server is reachable from Supabase Edge Functions, and the TLS certificate is trusted.
         </p>
       </div>
 
@@ -170,10 +185,15 @@ export default function Settings() {
               </label>
             </div>
             <div className="p-4 border-t border-gray-200 flex justify-end gap-3">
-              <button onClick={() => { setShowAdd(false); resetForm(); }} className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg transition-colors">Cancel</button>
-              <button onClick={handleAdd} disabled={!form.name || !form.host || !form.username || !form.password_encrypted}
+              {addError && (
+                <div className="mr-auto text-xs text-red-700 bg-red-50 border border-red-200 px-3 py-2 rounded-lg max-w-52">
+                  {addError}
+                </div>
+              )}
+              <button onClick={() => { setShowAdd(false); resetForm(); setAddError(''); }} className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg transition-colors">Cancel</button>
+              <button onClick={handleAdd} disabled={saving || !form.name || !form.host || !form.username || !form.password_encrypted}
                 className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors text-sm font-medium">
-                Add Console
+                {saving ? 'Adding...' : 'Add Console'}
               </button>
             </div>
           </div>

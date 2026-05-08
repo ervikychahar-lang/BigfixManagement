@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import { useFailedResults, useConsoles, useResolutions, useAppliedResolutions } from '../hooks/useBigFix';
-import { AlertTriangle, Search, Wrench, Zap, Eye, Plus, X, Check, RefreshCw, Shield } from 'lucide-react';
+import { AlertTriangle, Wrench, Zap, Eye, Plus, X, Check, RefreshCw, Shield } from 'lucide-react';
 import type { BigFixActionResult, ResolutionType, AnalysisResult } from '../lib/api';
 import { bigfixApi } from '../lib/api';
 
@@ -15,11 +15,11 @@ export default function FailureReports() {
   const consoleId = defaultConsole?.id || null;
   const { failures, loading, fetch: refetchFailures } = useFailedResults(consoleId);
   const { resolutions, addResolution, applyFix } = useResolutions();
-  const [search, setSearch] = useState('');
   const [selectedFailure, setSelectedFailure] = useState<BigFixActionResult | null>(null);
   const [showAddResolution, setShowAddResolution] = useState(false);
   const [showApplyModal, setShowApplyModal] = useState<BigFixActionResult | null>(null);
   const [applying, setApplying] = useState<string | null>(null);
+  const [applyingGenerated, setApplyingGenerated] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState<string | null>(null);
   const [analysisResults, setAnalysisResults] = useState<Record<string, AnalysisResult[]>>({});
   const [newResolution, setNewResolution] = useState({
@@ -29,22 +29,15 @@ export default function FailureReports() {
 
   const { applied, loading: appliedLoading } = useAppliedResolutions(selectedFailure?.id || null);
 
-  const filtered = useMemo(() => {
-    if (!search) return failures;
-    const q = search.toLowerCase();
-    return failures.filter(f =>
-      (f.error_message || '').toLowerCase().includes(q) ||
-      (f.result_code || '').toLowerCase().includes(q) ||
-      ((f as any).bigfix_computers?.name || '').toLowerCase().includes(q) ||
-      ((f as any).bigfix_actions?.name || '').toLowerCase().includes(q)
-    );
-  }, [failures, search]);
+  const filtered = failures;
 
   const matchingResolutions = (failure: BigFixActionResult) => {
     return resolutions.filter(r => {
       if (r.error_code && failure.result_code && r.error_code === failure.result_code) return true;
       if (r.error_pattern) {
-        try { return new RegExp(r.error_pattern, 'i').test(failure.error_message || ''); } catch { return false; }
+        try {
+          return new RegExp(r.error_pattern, 'i').test(`${failure.error_message || ''} ${failure.log_excerpt || ''} ${failure.result_code || ''}`);
+        } catch { return false; }
       }
       return false;
     });
@@ -54,17 +47,30 @@ export default function FailureReports() {
     if (!consoleId) return;
     setApplying(failure.id);
     try {
-      await applyFix(consoleId, failure.id, resolutionId, appliedBy);
+      const redeployAfterFix = appliedBy === 'auto';
+      if (redeployAfterFix && !window.confirm('Auto-Fix script deploy hoga, phir original failed action redeploy hoga. Continue?')) return;
+      await applyFix(consoleId, failure.id, resolutionId, appliedBy, redeployAfterFix);
       await refetchFailures();
       setShowApplyModal(null);
     } catch (e) { console.error(e); } finally { setApplying(null); }
+  };
+
+  const handleApplyGeneratedFix = async (failure: BigFixActionResult, proposedResolution: NonNullable<AnalysisResult['proposedResolution']>) => {
+    if (!consoleId) return;
+    if (!proposedResolution.script?.trim()) return;
+    if (!window.confirm('Generated Auto-Fix script deploy hoga, uske baad original failed action redeploy hoga. Continue?')) return;
+    setApplyingGenerated(failure.id);
+    try {
+      await bigfixApi.applyGeneratedFix(consoleId, failure.id, proposedResolution, true);
+      await refetchFailures();
+    } catch (e) { console.error(e); } finally { setApplyingGenerated(null); }
   };
 
   const handleAnalyzeFailure = async (failure: BigFixActionResult) => {
     if (!consoleId) return;
     setAnalyzing(failure.id);
     try {
-      const actionId = (failure as any).bigfix_actions?.id || failure.action_id;
+      const actionId = failure.action_id;
       if (actionId) {
         const result = await bigfixApi.analyzeFailures(consoleId, actionId);
         if (result.analysis) {
@@ -124,12 +130,6 @@ export default function FailureReports() {
         </div>
       )}
 
-      <div className="relative">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
-        <input type="text" placeholder="Search by error message, code, computer, or action..." value={search} onChange={e => setSearch(e.target.value)}
-          className="w-full pl-10 pr-4 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" />
-      </div>
-
       {loading ? (
         <div className="flex items-center justify-center py-20">
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600" />
@@ -138,14 +138,14 @@ export default function FailureReports() {
         <div className="text-center py-20 text-gray-500">
           <Shield className="w-12 h-12 mx-auto mb-3 text-emerald-300" />
           <p className="text-lg font-medium">No failures found</p>
-          <p className="text-sm mt-1">{failures.length === 0 ? 'All actions are healthy!' : 'Try adjusting your search.'}</p>
+          <p className="text-sm mt-1">All actions are healthy.</p>
         </div>
       ) : (
         <div className="space-y-3">
           {filtered.map(failure => {
             const matches = matchingResolutions(failure);
-            const computer = (failure as any).bigfix_computers;
-            const action = (failure as any).bigfix_actions;
+            const computer = failure.bigfix_computers;
+            const action = failure.bigfix_actions;
             const analysis = analysisResults[failure.id];
 
             return (
@@ -158,6 +158,8 @@ export default function FailureReports() {
                         <h3 className="font-semibold text-gray-900 truncate">{action?.name || 'Unknown Action'}</h3>
                       </div>
                       <div className="text-xs text-gray-500 space-x-3">
+                        <span>By: {action?.created_by || '-'}</span>
+                        <span>Started: {action?.start_time ? new Date(action.start_time).toLocaleString() : '-'}</span>
                         <span>Computer: {computer?.name || '-'}</span>
                         <span>OS: {computer?.os || '-'}</span>
                         <span>IP: {computer?.ip_address || '-'}</span>
@@ -172,6 +174,13 @@ export default function FailureReports() {
                   {failure.error_message && (
                     <div className="mt-2 p-2 bg-red-50 rounded-lg border border-red-100">
                       <p className="text-xs text-red-700 font-mono break-all">{failure.error_message}</p>
+                    </div>
+                  )}
+
+                  {failure.log_excerpt && (
+                    <div className="mt-2 p-2 bg-gray-50 rounded-lg border border-gray-200">
+                      <p className="text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Fetched log detail</p>
+                      <p className="text-xs text-gray-700 font-mono break-all">{failure.log_excerpt}</p>
                     </div>
                   )}
 
@@ -219,13 +228,35 @@ export default function FailureReports() {
                             </span>
                           </div>
                           <p className="text-xs text-gray-600 mb-2">{ar.proposedResolution.description}</p>
+                          {(ar.rootCause || ar.detail) && (
+                            <div className="mb-2 p-2 bg-white/70 border border-amber-100 rounded">
+                              {ar.rootCause && <p className="text-xs font-semibold text-gray-800">{ar.rootCause} {ar.confidence && <span className="font-normal text-gray-500">({ar.confidence} confidence)</span>}</p>}
+                              {ar.detail && <p className="text-xs text-gray-600 mt-1">{ar.detail}</p>}
+                              {ar.logExcerpt && <p className="text-xs text-gray-600 mt-1 font-mono">{ar.logExcerpt}</p>}
+                              {ar.evidence && ar.evidence.length > 0 && (
+                                <ul className="mt-1 text-xs text-gray-500 list-disc list-inside space-y-0.5">
+                                  {ar.evidence.slice(0, 4).map((item, i) => <li key={i}>{item}</li>)}
+                                </ul>
+                              )}
+                            </div>
+                          )}
                           {ar.proposedResolution.steps.length > 0 && (
                             <ol className="text-xs text-gray-600 list-decimal list-inside space-y-0.5 mb-2">
                               {ar.proposedResolution.steps.map((step, i) => <li key={i}>{step}</li>)}
                             </ol>
                           )}
                           {ar.proposedResolution.type === 'auto' && ar.proposedResolution.script && (
-                            <pre className="p-2 bg-gray-800 text-green-400 rounded text-xs font-mono overflow-x-auto">{ar.proposedResolution.script}</pre>
+                            <>
+                              <pre className="p-2 bg-gray-800 text-green-400 rounded text-xs font-mono overflow-x-auto">{ar.proposedResolution.script}</pre>
+                              <div className="mt-2 flex justify-end">
+                                <button onClick={() => handleApplyGeneratedFix(failure, ar.proposedResolution!)}
+                                  disabled={applyingGenerated === failure.id}
+                                  className="flex items-center gap-1 px-3 py-1.5 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50 transition-colors text-xs font-medium">
+                                  <Zap className="w-3 h-3" />
+                                  {applyingGenerated === failure.id ? 'Deploying...' : 'Confirm Auto-Fix & Redeploy'}
+                                </button>
+                              </div>
+                            </>
                           )}
                         </div>
                       ))}
@@ -247,7 +278,7 @@ export default function FailureReports() {
                         {applied.map(ar => (
                           <div key={ar.id} className="flex items-center justify-between p-3 bg-white rounded-lg border border-gray-200">
                             <div>
-                              <p className="text-sm font-medium text-gray-900">{(ar as any).bigfix_failure_resolutions?.title || 'Unknown'}</p>
+                              <p className="text-sm font-medium text-gray-900">{ar.bigfix_failure_resolutions?.title || 'Unknown'}</p>
                               <p className="text-xs text-gray-500">Applied: {ar.applied_by} | {new Date(ar.created_at).toLocaleString()}</p>
                               {ar.output && <p className="text-xs text-gray-400 mt-1">{ar.output}</p>}
                             </div>

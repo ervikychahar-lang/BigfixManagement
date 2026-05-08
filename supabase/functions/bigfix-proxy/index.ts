@@ -6,6 +6,13 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
+type BigFixConsoleConfig = {
+  host: string;
+  port: number;
+  username: string;
+  password_encrypted: string;
+};
+
 function jsonResponse(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -24,21 +31,87 @@ async function getConsole(supabase: ReturnType<typeof createClient>, consoleId: 
   return data;
 }
 
-async function bigfixRequest(console: { host: string; port: number; username: string; password_encrypted: string }, path: string, method = "GET", body?: string) {
-  const url = `https://${console.host}:${console.port}/api${path}`;
+function normalizeBigFixHost(host: string) {
+  return host.trim().replace(/^https?:\/\//i, "").replace(/\/api\/?$/i, "").replace(/\/$/, "");
+}
+
+function getBigFixUrl(console: BigFixConsoleConfig, path: string) {
+  const host = normalizeBigFixHost(console.host);
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return `https://${host}:${console.port}/api${normalizedPath}`;
+}
+
+function explainBigFixError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+
+  if (lower.includes("certificate") || lower.includes("cert") || lower.includes("tls")) {
+    return `${message}. BigFix TLS certificate is not trusted by the edge runtime. Use a trusted certificate or deploy the proxy where your internal CA is trusted.`;
+  }
+  if (lower.includes("timed out") || lower.includes("abort")) {
+    return `${message}. Check BigFix host, port 52311, firewall rules, and whether Supabase Edge Functions can reach that network.`;
+  }
+  if (lower.includes("failed to fetch") || lower.includes("network") || lower.includes("dns")) {
+    return `${message}. BigFix may be unreachable from Supabase Edge Functions, blocked by firewall, or using a private DNS name.`;
+  }
+
+  return message;
+}
+
+function escapeXml(value: unknown) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function cleanXmlText(value: string) {
+  return String(value || "")
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getXmlTag(block: string, tag: string) {
+  const match = block.match(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`));
+  return match ? cleanXmlText(match[1]) : "";
+}
+
+async function bigfixRequest(console: BigFixConsoleConfig, path: string, method = "GET", body?: string) {
+  const url = getBigFixUrl(console, path);
   const credentials = btoa(`${console.username}:${console.password_encrypted}`);
   const headers: Record<string, string> = {
     "Authorization": `Basic ${credentials}`,
     "Content-Type": "application/xml",
   };
-  const opts: RequestInit = { method, headers };
-  if (body) opts.body = body;
-  const response = await fetch(url, opts);
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`BigFix API error ${response.status}: ${text.substring(0, 500)}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+
+  try {
+    const opts: RequestInit = { method, headers, signal: controller.signal };
+    if (body) opts.body = body;
+    const response = await fetch(url, opts);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`BigFix API error ${response.status}: ${text.substring(0, 500)}`);
+    }
+    return response;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error(`BigFix request timed out after 45 seconds for ${url}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-  return response;
 }
 
 function parseComputersXML(xml: string): Array<Record<string, string>> {
@@ -125,26 +198,89 @@ function parseActionsXML(xml: string): Array<Record<string, string>> {
 
 function parseActionStatusXML(xml: string): Array<Record<string, string>> {
   const results: Array<Record<string, string>> = [];
-  const resultRegex = /<Result\s+[^>]*?>([\s\S]*?)<\/Result>/g;
+  const resultRegex = /<Result\b[^>]*>([\s\S]*?)<\/Result>/g;
   let match;
   while ((match = resultRegex.exec(xml)) !== null) {
     const block = match[1];
-    const get = (tag: string) => {
-      const m = block.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`));
-      return m ? m[1].trim() : "";
-    };
     results.push({
-      ComputerID: get("ComputerID"),
-      ComputerName: get("ComputerName"),
-      Status: get("Status"),
-      ResultCode: get("ResultCode"),
-      ErrorMessage: get("ErrorMessage"),
-      RetryCount: get("RetryCount") || "0",
-      StartedAt: get("StartedAt"),
-      CompletedAt: get("CompletedAt"),
+      ComputerID: getXmlTag(block, "ComputerID"),
+      ComputerName: getXmlTag(block, "ComputerName"),
+      Status: getXmlTag(block, "Status"),
+      State: getXmlTag(block, "State"),
+      LineNumber: getXmlTag(block, "LineNumber") || getXmlTag(block, "Line"),
+      ResultCode: getXmlTag(block, "ResultCode") || getXmlTag(block, "ExitCode"),
+      ErrorMessage: getXmlTag(block, "ErrorMessage") || getXmlTag(block, "Error"),
+      RetryCount: getXmlTag(block, "RetryCount") || "0",
+      StartedAt: getXmlTag(block, "StartedAt") || getXmlTag(block, "StartTime"),
+      CompletedAt: getXmlTag(block, "CompletedAt") || getXmlTag(block, "EndTime"),
+      LogDetail: extractActionLogDetail(block),
     });
   }
-  return results;
+  return results.map(result => ({ ...result, LogExcerpt: buildLogExcerpt(result, result.LogDetail) }));
+}
+
+function extractActionLogDetail(block: string) {
+  const tags = [
+    "Log",
+    "ActionLog",
+    "ActionLogText",
+    "LogText",
+    "LogExcerpt",
+    "ExecutionLog",
+    "Output",
+    "StdOut",
+    "StdErr",
+    "ResultText",
+    "ErrorText",
+    "LastError",
+    "FailureReason",
+    "Message",
+    "DownloadStatus",
+  ];
+  const details: string[] = [];
+  for (const tag of tags) {
+    const value = getXmlTag(block, tag);
+    if (value && !details.includes(value)) details.push(value);
+  }
+  return details.join(" | ").slice(0, 4000);
+}
+
+function buildLogExcerpt(result: Record<string, string>, logDetail = "") {
+  const parts = [];
+  if (result.Status) parts.push(`Status: ${result.Status}`);
+  if (result.State) parts.push(`State: ${result.State}`);
+  if (result.LineNumber) parts.push(`Line: ${result.LineNumber}`);
+  if (result.ResultCode) parts.push(`Exit/Result code: ${result.ResultCode}`);
+  if (result.ErrorMessage) parts.push(`Message: ${result.ErrorMessage}`);
+  if (logDetail) parts.push(`Log detail: ${logDetail}`);
+  return parts.join(" | ");
+}
+
+function generateActionScriptFromSteps(steps: string[], title = "Generated Auto-Fix") {
+  const text = `${title} ${(steps || []).join(" ")}`.toLowerCase();
+  const lines = [
+    `// Auto-generated from proposed solution steps: ${title}`,
+    "if {windows of operating system}",
+  ];
+  let addedCommand = false;
+
+  if (/besclient|client service|agent|relay autoselection|relay selection/.test(text)) {
+    lines.push("waithidden sc.exe stop BESClient");
+    lines.push('pause while {exists running service "BESClient"}');
+    lines.push("waithidden sc.exe start BESClient");
+    addedCommand = true;
+  }
+  if (/disk|space|temp|temporary|storage/.test(text)) {
+    lines.push('waithidden cmd.exe /C if exist "%windir%\\Temp" del /q /f /s "%windir%\\Temp\\*"');
+    addedCommand = true;
+  }
+  if (/download|prefetch|hash|sha1|sha256|relay cache/.test(text)) {
+    lines.push("delete __Download");
+    addedCommand = true;
+  }
+  if (!addedCommand) lines.push("waithidden cmd.exe /C echo Auto-fix analysis completed");
+  lines.push("endif");
+  return lines.join("\n");
 }
 
 Deno.serve(async (req: Request) => {
@@ -155,19 +291,27 @@ Deno.serve(async (req: Request) => {
   try {
     const body = await req.json();
     const { action } = body;
+    if (!action || typeof action !== "string") {
+      return errorResponse("Missing action", 400);
+    }
 
-    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !supabaseKey) {
+      return errorResponse("Supabase function is missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY", 500);
+    }
     const supabase = createClient(supabaseUrl, supabaseKey);
 
     switch (action) {
       case "test-connection": {
         const { consoleId } = body;
+        if (!consoleId) return errorResponse("Missing consoleId", 400);
         const console = await getConsole(supabase, consoleId);
         try {
-          const resp = await bigfixRequest(console, "/computers", "GET");
+          const relevance = encodeURIComponent("version of server");
+          const resp = await bigfixRequest(console, `/query?relevance=${relevance}`, "GET");
           const text = await resp.text();
-          const versionMatch = text.match(/ServerVersion="([^"]+)"/);
+          const versionMatch = text.match(/<Answer[^>]*>([^<]+)<\/Answer>/) || text.match(/ServerVersion="([^"]+)"/);
           await supabase.from("bigfix_consoles").update({
             status: "connected",
             last_connected: new Date().toISOString(),
@@ -175,7 +319,7 @@ Deno.serve(async (req: Request) => {
           return jsonResponse({ success: true, message: "Connection successful", serverVersion: versionMatch?.[1] || "Unknown" });
         } catch (e) {
           await supabase.from("bigfix_consoles").update({ status: "error" }).eq("id", consoleId);
-          return jsonResponse({ success: false, message: (e as Error).message });
+          return jsonResponse({ success: false, message: explainBigFixError(e) });
         }
       }
 
@@ -311,7 +455,7 @@ Deno.serve(async (req: Request) => {
         if (actionData.data) {
           for (const res of parsed) {
             const compData = await supabase.from("bigfix_computers")
-              .select("id").eq("bigfix_id", res.ComputerID).maybeSingle();
+              .select("id").eq("console_id", consoleId).eq("bigfix_id", res.ComputerID).maybeSingle();
 
             if (compData.data) {
               const existing = await supabase.from("bigfix_action_results")
@@ -321,8 +465,11 @@ Deno.serve(async (req: Request) => {
                 action_id: actionData.data.id,
                 computer_id: compData.data.id,
                 status: res.Status,
+                state: res.State,
+                line_number: parseInt(res.LineNumber) || 0,
                 result_code: res.ResultCode,
                 error_message: res.ErrorMessage,
+                log_excerpt: res.LogExcerpt,
                 retry_count: parseInt(res.RetryCount) || 0,
                 started_at: res.StartedAt || null,
                 completed_at: res.CompletedAt || null,
@@ -357,17 +504,26 @@ Deno.serve(async (req: Request) => {
 
       case "deploy-action": {
         const { consoleId, contentId, targetComputerIds, actionName } = body;
+        if (!Array.isArray(targetComputerIds) || targetComputerIds.length === 0) {
+          return errorResponse("Select at least one target computer before deploying an action", 400);
+        }
         const console = await getConsole(supabase, consoleId);
 
         const contentData = await supabase.from("bigfix_content")
           .select("*").eq("id", contentId).maybeSingle();
         if (!contentData.data) throw new Error("Content not found");
 
+        const targetXml = (targetComputerIds || [])
+          .map((id: string) => `      <ComputerID>${escapeXml(id)}</ComputerID>`)
+          .join("\n");
         const actionXML = `<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
   <SingleAction>
-    <Title>${actionName || contentData.data.name}</Title>
-    <Relevance>${contentData.data.relevance || "true"}</Relevance>
-    <ActionScript>${contentData.data.action_script || ""}</ActionScript>
+    <Title>${escapeXml(actionName || contentData.data.name)}</Title>
+    <Relevance>${escapeXml(contentData.data.relevance || "true")}</Relevance>
+    <ActionScript>${escapeXml(contentData.data.action_script || "")}</ActionScript>
+    <Target>
+${targetXml}
+    </Target>
     <Settings>
       <HasRunningTimeLimit>true</HasRunningTimeLimit>
       <RunningTimeLimitMinutes>60</RunningTimeLimitMinutes>
@@ -394,7 +550,7 @@ Deno.serve(async (req: Request) => {
         if (newAction) {
           for (const compBigfixId of targetComputerIds) {
             const comp = await supabase.from("bigfix_computers")
-              .select("id").eq("bigfix_id", compBigfixId).maybeSingle();
+              .select("id").eq("console_id", consoleId).eq("bigfix_id", compBigfixId).maybeSingle();
             if (comp.data) {
               await supabase.from("bigfix_action_results").insert({
                 action_id: newAction.id,
@@ -422,7 +578,7 @@ Deno.serve(async (req: Request) => {
       }
 
       case "analyze-failures": {
-        const { consoleId, actionId } = body;
+        const { actionId } = body;
         const actionData = await supabase.from("bigfix_actions")
           .select("*").eq("id", actionId).maybeSingle();
         if (!actionData.data) throw new Error("Action not found");
@@ -440,32 +596,40 @@ Deno.serve(async (req: Request) => {
           const matchingResolutions = (resolutions || []).filter((r: Record<string, unknown>) => {
             if (r.error_code && result.result_code && r.error_code === result.result_code) return true;
             if (r.error_pattern) {
-              try { return new RegExp(r.error_pattern as string, "i").test((result.error_message as string) || ""); } catch { return false; }
+              try {
+                return new RegExp(r.error_pattern as string, "i").test(`${result.error_message || ""} ${result.log_excerpt || ""} ${result.result_code || ""}`);
+              } catch { return false; }
             }
             return false;
           });
 
           const bestResolution = matchingResolutions[0];
+          const steps = (bestResolution?.resolution_steps as string[] | undefined) || ["Verify the endpoint is online", "Review the captured action log detail", "Redeploy the original action after remediation"];
+          const script = String(bestResolution?.resolution_script || "") || generateActionScriptFromSteps(steps, String(bestResolution?.title || "Generated endpoint remediation"));
           return {
             computerId: computer?.bigfix_id || "",
             computerName: computer?.name || "Unknown",
             status: result.result_code || "ERROR",
             isError: true,
-            state: "Failed",
-            lineNumber: 0,
+            state: result.state || "Failed",
+            lineNumber: result.line_number || 0,
+            logExcerpt: result.log_excerpt || "",
             retryCount: result.retry_count || 0,
             proposedResolution: bestResolution ? {
               title: bestResolution.title,
               description: bestResolution.description,
               type: bestResolution.resolution_type,
-              steps: bestResolution.resolution_steps || [],
-              script: bestResolution.resolution_script || "",
+              steps,
+              script,
+              resolutionId: bestResolution.id,
+              generatedScript: !bestResolution.resolution_script,
             } : {
-              title: "Generic Retry",
-              description: "Retry the action on this computer",
-              type: "manual",
-              steps: ["Verify the endpoint is online", "Check disk space and permissions", "Retry the action"],
-              script: "",
+              title: "Generated endpoint remediation",
+              description: "Built from the failed action status/log detail captured from BigFix.",
+              type: "auto",
+              steps,
+              script,
+              generatedScript: true,
             },
           };
         });
@@ -496,25 +660,36 @@ Deno.serve(async (req: Request) => {
           try {
             const console = await getConsole(supabase, consoleId);
             const resultData = await supabase.from("bigfix_action_results")
-              .select("*, bigfix_computers(bigfix_id), bigfix_actions(bigfix_id)")
+              .select("*, bigfix_computers(bigfix_id), bigfix_actions(id,bigfix_id)")
               .eq("id", actionResultId).maybeSingle();
 
             if (resultData.data) {
               const computer = resultData.data.bigfix_computers as Record<string, string>;
-              const act = resultData.data.bigfix_actions as Record<string, string>;
+              const originalAction = resultData.data.bigfix_actions as Record<string, string>;
               const fixXML = `<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
   <SingleAction>
-    <Title>Auto-Fix: ${resolution.data.title}</Title>
-    <Relevance>computer id = ${computer?.bigfix_id || "0"}</Relevance>
-    <ActionScript>${resolution.data.resolution_script}</ActionScript>
+    <Title>${escapeXml(`Auto-Fix: ${resolution.data.title}`)}</Title>
+    <Relevance>${escapeXml(`computer id = ${computer?.bigfix_id || "0"}`)}</Relevance>
+    <ActionScript>${escapeXml(resolution.data.resolution_script)}</ActionScript>
   </SingleAction>
 </BES>`;
               await bigfixRequest(console, "/action", "POST", fixXML);
+              if (body.redeployAfterFix && originalAction?.bigfix_id) {
+                await bigfixRequest(console, `/action/${originalAction.bigfix_id}/redeploy`, "POST");
+                await supabase.from("bigfix_actions").update({
+                  status: "pending",
+                  completed_count: 0,
+                  failed_count: 0,
+                  running_count: 0,
+                  not_run_count: 0,
+                  updated_at: new Date().toISOString(),
+                }).eq("id", originalAction.id);
+              }
             }
 
             await supabase.from("bigfix_applied_resolutions").update({
               status: "succeeded",
-              output: "Auto-fix action deployed successfully",
+              output: body.redeployAfterFix ? "Auto-fix action deployed and original action redeployed" : "Auto-fix action deployed successfully",
               completed_at: new Date().toISOString(),
             }).eq("id", appliedRes.id);
 
@@ -540,6 +715,81 @@ Deno.serve(async (req: Request) => {
         }
 
         return jsonResponse({ success: true, message: "Fix applied" });
+      }
+
+      case "apply-generated-fix": {
+        const { consoleId, actionResultId, proposedResolution, redeployAfterFix } = body;
+        const script = String(proposedResolution?.script || "");
+        if (!script.trim()) throw new Error("Generated fix script is empty");
+        const console = await getConsole(supabase, consoleId);
+        const resultData = await supabase.from("bigfix_action_results")
+          .select("*, bigfix_computers(bigfix_id,name), bigfix_actions(id,bigfix_id,name)")
+          .eq("id", actionResultId).maybeSingle();
+        if (!resultData.data) throw new Error("Action result not found");
+        const computer = resultData.data.bigfix_computers as Record<string, string>;
+        const originalAction = resultData.data.bigfix_actions as Record<string, string>;
+        let resolutionId = proposedResolution?.resolutionId || null;
+        if (!resolutionId) {
+          const { data: generatedResolution } = await supabase.from("bigfix_failure_resolutions").insert({
+            error_code: resultData.data.result_code || "",
+            error_pattern: resultData.data.error_message || resultData.data.log_excerpt || "",
+            title: proposedResolution?.title || "Generated auto-fix",
+            description: proposedResolution?.description || "Generated from failed action log details.",
+            resolution_type: "auto",
+            resolution_script: script,
+            resolution_steps: proposedResolution?.steps || [],
+            is_verified: false,
+            use_count: 0,
+            success_rate: 0,
+          }).select("id").maybeSingle();
+          resolutionId = generatedResolution?.id || null;
+        }
+
+        const { data: appliedRes } = await supabase.from("bigfix_applied_resolutions").insert({
+          action_result_id: actionResultId,
+          resolution_id: resolutionId,
+          status: "running",
+          applied_by: "auto",
+        }).select().maybeSingle();
+
+        try {
+          const fixXML = `<BES xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BES.xsd">
+  <SingleAction>
+    <Title>${escapeXml(`Auto-Fix: ${proposedResolution?.title || originalAction?.name || "Generated remediation"}`)}</Title>
+    <Relevance>${escapeXml(`computer id = ${computer?.bigfix_id || "0"}`)}</Relevance>
+    <ActionScript>${escapeXml(script)}</ActionScript>
+  </SingleAction>
+</BES>`;
+          await bigfixRequest(console, "/action", "POST", fixXML);
+          if (redeployAfterFix && originalAction?.bigfix_id) {
+            await bigfixRequest(console, `/action/${originalAction.bigfix_id}/redeploy`, "POST");
+            await supabase.from("bigfix_actions").update({
+              status: "pending",
+              completed_count: 0,
+              failed_count: 0,
+              running_count: 0,
+              not_run_count: 0,
+              updated_at: new Date().toISOString(),
+            }).eq("id", originalAction.id);
+          }
+          if (appliedRes) {
+            await supabase.from("bigfix_applied_resolutions").update({
+              status: "succeeded",
+              output: redeployAfterFix ? "Generated auto-fix deployed and original action redeployed" : "Generated auto-fix deployed",
+              completed_at: new Date().toISOString(),
+            }).eq("id", appliedRes.id);
+          }
+          return jsonResponse({ success: true, message: "Generated auto-fix applied" });
+        } catch (e) {
+          if (appliedRes) {
+            await supabase.from("bigfix_applied_resolutions").update({
+              status: "failed",
+              output: `Generated auto-fix failed: ${(e as Error).message}`,
+              completed_at: new Date().toISOString(),
+            }).eq("id", appliedRes.id);
+          }
+          throw e;
+        }
       }
 
       case "redeploy-action": {

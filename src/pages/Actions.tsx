@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { useActions, useConsoles, useActionResults } from '../hooks/useBigFix';
 import { Activity, RefreshCw, Play, Square, Filter, Clock, CheckCircle, XCircle, AlertCircle, Eye, Zap, Search, RotateCcw } from 'lucide-react';
 import type { ActionStatus, BigFixAction, AnalysisResult } from '../lib/api';
@@ -35,6 +35,16 @@ export default function Actions() {
   const [analysisData, setAnalysisData] = useState<Record<string, { analysis: AnalysisResult[]; failedComputers: number; totalComputers: number; actionName: string }>>({});
   const [redeploying, setRedeploying] = useState<string | null>(null);
   const { results, loading: resultsLoading } = useActionResults(expandedAction);
+
+  useEffect(() => {
+    if (!consoleId) return;
+    const timer = window.setInterval(() => {
+      actions
+        .filter(action => action.bigfix_id && (action.status === 'running' || action.status === 'pending'))
+        .forEach(action => { void fetchActionStatus(action.bigfix_id); });
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, [actions, consoleId, fetchActionStatus]);
 
   const handleSync = async () => {
     setSyncing(true);
@@ -239,7 +249,19 @@ export default function Actions() {
                               </div>
                               <div className="ml-6">
                                 <p className="text-xs text-red-600 font-mono bg-red-50 px-2 py-1 rounded mb-2">{ar.status}</p>
-                                {ar.lineNumber > 0 && <p className="text-xs text-gray-500">Failed at line: {ar.lineNumber} | Retries: {ar.retryCount}</p>}
+                                {(ar.lineNumber > 0 || ar.retryCount > 0) && <p className="text-xs text-gray-500">Failed at line: {ar.lineNumber || '-'} | Retries: {ar.retryCount}</p>}
+                                {ar.logExcerpt && <p className="text-xs text-gray-600 font-mono bg-gray-50 border border-gray-200 px-2 py-1 rounded mb-2 break-all">{ar.logExcerpt}</p>}
+                                {(ar.rootCause || ar.detail) && (
+                                  <div className="mt-2 p-2 bg-gray-50 border border-gray-200 rounded">
+                                    {ar.rootCause && <p className="text-xs font-semibold text-gray-800">{ar.rootCause} {ar.confidence && <span className="font-normal text-gray-500">({ar.confidence} confidence)</span>}</p>}
+                                    {ar.detail && <p className="text-xs text-gray-600 mt-1">{ar.detail}</p>}
+                                    {ar.evidence && ar.evidence.length > 0 && (
+                                      <ul className="mt-1 text-xs text-gray-500 list-disc list-inside space-y-0.5">
+                                        {ar.evidence.slice(0, 4).map((item, i) => <li key={i}>{item}</li>)}
+                                      </ul>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                             </div>
                           </div>
@@ -298,8 +320,8 @@ export default function Actions() {
                               const rs = RESULT_STYLES[r.status] || { bg: 'bg-gray-100', text: 'text-gray-600' };
                               return (
                                 <tr key={r.id} className="border-b border-gray-100">
-                                  <td className="px-3 py-2 font-medium text-gray-900">{(r as any).bigfix_computers?.name || '-'}</td>
-                                  <td className="px-3 py-2 text-gray-600 text-xs">{(r as any).bigfix_computers?.os || '-'}</td>
+                                  <td className="px-3 py-2 font-medium text-gray-900">{r.bigfix_computers?.name || '-'}</td>
+                                  <td className="px-3 py-2 text-gray-600 text-xs">{r.bigfix_computers?.os || '-'}</td>
                                   <td className="px-3 py-2">
                                     <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${rs.bg} ${rs.text}`}>{r.status}</span>
                                   </td>
