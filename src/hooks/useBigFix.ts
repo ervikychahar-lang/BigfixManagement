@@ -12,6 +12,7 @@ import type {
   ContentType,
   ActionStatus,
   AnalysisResult,
+  AnalyzerConfig,
 } from '../lib/api';
 
 type ListResponse<T> = { data: T[] };
@@ -53,6 +54,28 @@ export function useConsoles() {
   };
 
   return { consoles, loading, fetch, addConsole, updateConsole, deleteConsole, testConnection };
+}
+
+export function useAnalyzerConfig() {
+  const [config, setConfig] = useState<AnalyzerConfig | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const fetch = useCallback(async () => {
+    setLoading(true);
+    const result = await bigfixApi.getAnalyzerConfig() as ItemResponse<AnalyzerConfig>;
+    setConfig(result.data || null);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { fetch(); }, [fetch]);
+
+  const update = async (updates: Partial<AnalyzerConfig>) => {
+    const result = await bigfixApi.updateAnalyzerConfig(updates) as ItemResponse<AnalyzerConfig>;
+    setConfig(result.data);
+    return result.data;
+  };
+
+  return { config, loading, fetch, update };
 }
 
 export function useComputers(consoleId: string | null) {

@@ -231,6 +231,7 @@ export default function FailureReports() {
                           {(ar.rootCause || ar.detail) && (
                             <div className="mb-2 p-2 bg-white/70 border border-amber-100 rounded">
                               {ar.rootCause && <p className="text-xs font-semibold text-gray-800">{ar.rootCause} {ar.confidence && <span className="font-normal text-gray-500">({ar.confidence} confidence)</span>}</p>}
+                              {ar.analysisSource && <p className="text-[11px] text-blue-600 mt-1">Source: {ar.analysisSource}</p>}
                               {ar.detail && <p className="text-xs text-gray-600 mt-1">{ar.detail}</p>}
                               {ar.logExcerpt && <p className="text-xs text-gray-600 mt-1 font-mono">{ar.logExcerpt}</p>}
                               {ar.evidence && ar.evidence.length > 0 && (

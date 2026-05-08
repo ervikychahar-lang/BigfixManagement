@@ -266,6 +266,7 @@ export default function Actions() {
                                 {(ar.rootCause || ar.detail) && (
                                   <div className="mt-2 p-2 bg-gray-50 border border-gray-200 rounded">
                                     {ar.rootCause && <p className="text-xs font-semibold text-gray-800">{ar.rootCause} {ar.confidence && <span className="font-normal text-gray-500">({ar.confidence} confidence)</span>}</p>}
+                                    {ar.analysisSource && <p className="text-[11px] text-blue-600 mt-1">Source: {ar.analysisSource}</p>}
                                     {ar.detail && <p className="text-xs text-gray-600 mt-1">{ar.detail}</p>}
                                     {ar.evidence && ar.evidence.length > 0 && (
                                       <ul className="mt-1 text-xs text-gray-500 list-disc list-inside space-y-0.5">

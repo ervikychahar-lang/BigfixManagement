@@ -46,6 +46,8 @@ async function callEdgeFunction(action: string, payload: Record<string, unknown>
 
 export const bigfixApi = {
   listConsoles: () => callEdgeFunction('list-consoles', {}),
+  getAnalyzerConfig: () => callEdgeFunction('get-analyzer-config', {}),
+  updateAnalyzerConfig: (config: Record<string, unknown>) => callEdgeFunction('update-analyzer-config', { config }),
   addConsole: (console: Record<string, unknown>) => callEdgeFunction('add-console', { console }),
   updateConsole: (id: string, updates: Record<string, unknown>) => callEdgeFunction('update-console', { id, updates }),
   deleteConsole: (id: string) => callEdgeFunction('delete-console', { id }),
@@ -85,6 +87,8 @@ export type ContentType = 'fixlet' | 'task' | 'baseline' | 'patch';
 export type ActionStatus = 'pending' | 'running' | 'completed' | 'failed' | 'expired' | 'stopped';
 export type ResultStatus = 'Completed' | 'Failed' | 'Running' | 'NotRun' | 'Pending' | 'Downloaded';
 export type ResolutionType = 'manual' | 'auto';
+export type AnalyzerMode = 'local' | 'hybrid' | 'external';
+export type AnalyzerProvider = 'none' | 'aex' | 'runbook-ai' | 'custom';
 
 export interface BigFixConsole {
   id: string;
@@ -115,6 +119,18 @@ export interface BigFixComputer {
   sites?: string[];
   created_at: string;
   updated_at: string;
+}
+
+export interface AnalyzerConfig {
+  mode: AnalyzerMode;
+  provider: AnalyzerProvider;
+  base_url: string;
+  api_key: string;
+  auth_header: string;
+  org_id: string;
+  timeout_seconds: number;
+  enabled: boolean;
+  updated_at?: string;
 }
 
 export interface BigFixSite {
@@ -232,6 +248,7 @@ export interface AnalysisResult {
   confidence?: string;
   evidence?: string[];
   detail?: string;
+  analysisSource?: string;
   computerOnline?: boolean;
   proposedResolution: {
     title: string;

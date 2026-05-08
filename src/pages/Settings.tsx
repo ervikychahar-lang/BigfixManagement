@@ -1,19 +1,42 @@
 import { useState } from 'react';
-import { useConsoles } from '../hooks/useBigFix';
-import { Plus, Trash2, Plug, Check, X, Server, Star } from 'lucide-react';
+import { useAnalyzerConfig, useConsoles } from '../hooks/useBigFix';
+import { Plus, Trash2, Plug, Check, X, Server, Star, BrainCircuit, Save } from 'lucide-react';
+import type { AnalyzerConfig, AnalyzerMode, AnalyzerProvider } from '../lib/api';
 
 export default function Settings() {
   const { consoles, loading, addConsole, updateConsole, deleteConsole, testConnection } = useConsoles();
+  const { config: analyzerConfig, loading: analyzerLoading, update: updateAnalyzer } = useAnalyzerConfig();
   const [showAdd, setShowAdd] = useState(false);
   const [testing, setTesting] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [addError, setAddError] = useState('');
   const [testResult, setTestResult] = useState<Record<string, { success: boolean; message: string; serverVersion?: string }>>({});
+  const [analyzerSaving, setAnalyzerSaving] = useState(false);
+  const [analyzerMessage, setAnalyzerMessage] = useState('');
   const [form, setForm] = useState({
     name: '', host: '', port: 52311, username: '', password_encrypted: '', is_default: false,
   });
 
   const resetForm = () => setForm({ name: '', host: '', port: 52311, username: '', password_encrypted: '', is_default: false });
+
+  const handleAnalyzerChange = (updates: Partial<AnalyzerConfig>) => {
+    if (!analyzerConfig) return;
+    updateAnalyzer({ ...analyzerConfig, ...updates }).catch(error => setAnalyzerMessage(error instanceof Error ? error.message : 'Failed to update analyzer config'));
+  };
+
+  const handleSaveAnalyzer = async () => {
+    if (!analyzerConfig) return;
+    setAnalyzerSaving(true);
+    setAnalyzerMessage('');
+    try {
+      await updateAnalyzer(analyzerConfig);
+      setAnalyzerMessage('Analyzer configuration saved');
+    } catch (error) {
+      setAnalyzerMessage(error instanceof Error ? error.message : 'Failed to save analyzer configuration');
+    } finally {
+      setAnalyzerSaving(false);
+    }
+  };
 
   const handleAdd = async () => {
     setSaving(true);
@@ -72,6 +95,78 @@ export default function Settings() {
           The tool authenticates using your BigFix Console operator credentials via HTTP Basic Auth.
           Make sure the REST API is enabled, the server is reachable from Supabase Edge Functions, and the TLS certificate is trusted.
         </p>
+      </div>
+
+      <div className="bg-white border border-gray-200 rounded-xl p-5">
+        <div className="flex items-start justify-between gap-4 mb-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <BrainCircuit className="w-4 h-4 text-blue-600" />
+              <h2 className="text-sm font-semibold text-gray-900">Auto-Analyze Provider</h2>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">Use HCL BigFix AEX / Runbook AI for recommendations, with local fallback when unavailable.</p>
+          </div>
+          <button onClick={handleSaveAnalyzer} disabled={analyzerSaving || analyzerLoading || !analyzerConfig}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors text-xs font-medium">
+            <Save className="w-3.5 h-3.5" /> {analyzerSaving ? 'Saving...' : 'Save'}
+          </button>
+        </div>
+        {analyzerConfig && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label className="flex items-center gap-2 md:col-span-2 cursor-pointer">
+              <input type="checkbox" checked={analyzerConfig.enabled} onChange={e => handleAnalyzerChange({ enabled: e.target.checked })}
+                className="rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
+              <span className="text-sm text-gray-700">Enable external AI analyzer</span>
+            </label>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Mode</label>
+              <select value={analyzerConfig.mode} onChange={e => handleAnalyzerChange({ mode: e.target.value as AnalyzerMode })}
+                className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
+                <option value="local">Local rules only</option>
+                <option value="hybrid">AEX/Runbook AI first, local fallback</option>
+                <option value="external">External only with fallback on error</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Provider</label>
+              <select value={analyzerConfig.provider} onChange={e => handleAnalyzerChange({ provider: e.target.value as AnalyzerProvider })}
+                className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white">
+                <option value="none">None</option>
+                <option value="aex">HCL BigFix AEX</option>
+                <option value="runbook-ai">HCL BigFix Runbook AI</option>
+                <option value="custom">Custom compatible API</option>
+              </select>
+            </div>
+            <div className="md:col-span-2">
+              <label className="block text-sm font-medium text-gray-700 mb-1">Base URL</label>
+              <input type="text" value={analyzerConfig.base_url} onChange={e => handleAnalyzerChange({ base_url: e.target.value })}
+                className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                placeholder="https://aex.company.com" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Auth Header</label>
+              <input type="text" value={analyzerConfig.auth_header} onChange={e => handleAnalyzerChange({ auth_header: e.target.value })}
+                className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">API Key / Token</label>
+              <input type="password" value={analyzerConfig.api_key} onChange={e => handleAnalyzerChange({ api_key: e.target.value })}
+                className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                placeholder="Bearer token or API key" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Organization / Tenant ID</label>
+              <input type="text" value={analyzerConfig.org_id} onChange={e => handleAnalyzerChange({ org_id: e.target.value })}
+                className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Timeout Seconds</label>
+              <input type="number" value={analyzerConfig.timeout_seconds} onChange={e => handleAnalyzerChange({ timeout_seconds: parseInt(e.target.value, 10) || 30 })}
+                className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+          </div>
+        )}
+        {analyzerMessage && <p className="mt-3 text-xs text-gray-600">{analyzerMessage}</p>}
       </div>
 
       {loading ? (

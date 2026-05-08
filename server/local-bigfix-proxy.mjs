@@ -40,6 +40,7 @@ const emptyDb = {
   bigfix_action_results: [],
   bigfix_failure_resolutions: [],
   bigfix_applied_resolutions: [],
+  analyzer_config: null,
 };
 
 const defaultFailureResolutions = [
@@ -129,6 +130,17 @@ function writeDb(db) {
 }
 
 function normalizeDb(db) {
+  db.analyzer_config = db.analyzer_config || {
+    mode: 'local',
+    provider: 'none',
+    base_url: '',
+    api_key: '',
+    auth_header: 'Authorization',
+    org_id: '',
+    timeout_seconds: 30,
+    enabled: false,
+    updated_at: now(),
+  };
   if (!db.bigfix_failure_resolutions || db.bigfix_failure_resolutions.length === 0) {
     db.bigfix_failure_resolutions = defaultFailureResolutions.map(item => ({
       id: randomUUID(),
@@ -1038,12 +1050,188 @@ function proposedResolutionForFailure(resolution, diagnosis) {
   };
 }
 
+function normalizeExternalAnalysis(value) {
+  if (!value || typeof value !== 'object') return null;
+  const proposal = value.proposedResolution || value.proposed_resolution || value.resolution || value.recommendation || {};
+  const steps = Array.isArray(proposal.steps) ? proposal.steps
+    : Array.isArray(proposal.resolution_steps) ? proposal.resolution_steps
+      : Array.isArray(value.steps) ? value.steps
+        : [];
+  const type = String(proposal.type || proposal.resolution_type || value.type || '').toLowerCase() === 'auto' ? 'auto' : 'manual';
+  const title = String(proposal.title || value.title || value.rootCause || value.root_cause || '').trim();
+  const description = String(proposal.description || value.description || value.detail || '').trim();
+  if (!title && !description && steps.length === 0) return null;
+  return {
+    rootCause: value.rootCause || value.root_cause || value.category || undefined,
+    confidence: value.confidence || 'external',
+    detail: value.detail || value.summary || description,
+    evidence: Array.isArray(value.evidence) ? value.evidence : undefined,
+    proposedResolution: {
+      title: title || 'Runbook AI recommendation',
+      description: description || 'Recommendation returned by external analyzer.',
+      type,
+      steps,
+      script: String(proposal.script || proposal.resolution_script || value.script || ''),
+      resolutionId: proposal.resolutionId || proposal.resolution_id || value.runbookId || value.runbook_id,
+      generatedScript: Boolean(proposal.generatedScript || proposal.generated_script || value.generatedScript),
+    },
+    source: 'external',
+  };
+}
+
+function analyzerPayload(result, computer, action, diagnosis, resolution) {
+  return {
+    source: 'bigfix-management-tool',
+    action: {
+      id: action?.id,
+      bigfix_id: action?.bigfix_id,
+      name: action?.name,
+      type: action?.type,
+      status: action?.status,
+      created_by: action?.created_by,
+      start_time: action?.start_time,
+    },
+    computer: {
+      id: computer?.id,
+      bigfix_id: computer?.bigfix_id,
+      name: computer?.name,
+      os: computer?.os,
+      ip_address: computer?.ip_address,
+      last_report: computer?.last_report,
+      is_online: computer?.is_online,
+    },
+    failure: {
+      status: result.status,
+      state: result.state,
+      result_code: result.result_code,
+      error_message: result.error_message,
+      log_excerpt: result.log_excerpt,
+      line_number: result.line_number,
+      retry_count: result.retry_count,
+      started_at: result.started_at,
+      completed_at: result.completed_at,
+    },
+    local_diagnosis: diagnosis,
+    matched_resolution: resolution ? {
+      id: resolution.id,
+      title: resolution.title,
+      type: resolution.resolution_type,
+      steps: resolution.resolution_steps || [],
+    } : null,
+  };
+}
+
+function externalAnalyzerPath(provider) {
+  if (provider === 'aex') return '/api/analyze/bigfix-failure';
+  if (provider === 'runbook-ai') return '/api/runbook-ai/analyze';
+  return '/api/analyze';
+}
+
+function callExternalAnalyzer(config, payload) {
+  return new Promise((resolve, reject) => {
+    const baseUrl = String(config.base_url || '').replace(/\/$/, '');
+    if (!baseUrl) return resolve(null);
+    const endpoint = new URL(baseUrl + externalAnalyzerPath(config.provider));
+    const body = JSON.stringify({ orgId: config.org_id || undefined, payload });
+    const headers = {
+      'Content-Type': 'application/json',
+      [config.auth_header || 'Authorization']: String(config.api_key || '').startsWith('Bearer ')
+        ? config.api_key
+        : `Bearer ${config.api_key || ''}`,
+    };
+    const client = endpoint.protocol === 'http:' ? http : https;
+    const req = client.request(endpoint, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Length': Buffer.byteLength(body) },
+      timeout: Number(config.timeout_seconds || 30) * 1000,
+      rejectUnauthorized,
+    }, res => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => { text += chunk; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`Analyzer API error ${res.statusCode}: ${text.slice(0, 500)}`));
+          return;
+        }
+        try {
+          resolve(normalizeExternalAnalysis(text ? JSON.parse(text) : null));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('Analyzer API request timed out')));
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function analyzeWithHybridProvider(db, result, computer, action, resolution, diagnosis) {
+  const config = db.analyzer_config || {};
+  const localProposal = proposedResolutionForFailure(resolution, diagnosis);
+  const local = {
+    rootCause: diagnosis.rootCause,
+    confidence: diagnosis.confidence,
+    evidence: diagnosis.evidence,
+    detail: diagnosis.detail,
+    proposedResolution: localProposal,
+    source: 'local',
+  };
+
+  if (!config.enabled || config.mode === 'local' || !config.base_url || !config.api_key) return local;
+  try {
+    const external = await callExternalAnalyzer(config, analyzerPayload(result, computer, action, diagnosis, resolution));
+    if (external?.proposedResolution) {
+      if (external.proposedResolution.type === 'auto' && !external.proposedResolution.script) {
+        external.proposedResolution.script = generateActionScriptFromSteps(external.proposedResolution.steps || [], {
+          rootCause: external.rootCause || diagnosis.rootCause,
+          detail: external.detail || diagnosis.detail,
+        }, external.proposedResolution.title);
+        external.proposedResolution.generatedScript = true;
+      }
+      return {
+        ...local,
+        ...external,
+        evidence: external.evidence || local.evidence,
+        detail: external.detail || local.detail,
+      };
+    }
+  } catch (error) {
+    console.warn(`External analyzer failed, using local fallback: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return { ...local, source: 'local-fallback' };
+}
+
 async function handleAction(body) {
   const db = readDb();
 
   switch (body.action) {
     case 'list-consoles':
       return { data: sortByCreatedDesc(db.bigfix_consoles) };
+
+    case 'get-analyzer-config': {
+      const config = db.analyzer_config || {};
+      return { data: { ...config, api_key: config.api_key ? '********' : '' } };
+    }
+
+    case 'update-analyzer-config': {
+      const current = db.analyzer_config || {};
+      const updates = body.config || {};
+      db.analyzer_config = {
+        ...current,
+        ...updates,
+        api_key: updates.api_key === '********' ? current.api_key : updates.api_key,
+        mode: updates.mode || current.mode || 'local',
+        provider: updates.provider || current.provider || 'none',
+        timeout_seconds: Number(updates.timeout_seconds || current.timeout_seconds || 30),
+        enabled: Boolean(updates.enabled),
+        updated_at: now(),
+      };
+      writeDb(db);
+      return { data: { ...db.analyzer_config, api_key: db.analyzer_config.api_key ? '********' : '' } };
+    }
 
     case 'add-console': {
       const record = {
@@ -1390,11 +1578,13 @@ ${targetXml}
       const action = db.bigfix_actions.find(item => item.id === body.actionId);
       if (!action) throw new Error('Action not found');
       const failed = db.bigfix_action_results.filter(item => item.action_id === body.actionId && item.status === 'Failed');
-      const analysis = failed.map(result => {
+      const analysis = [];
+      for (const result of failed) {
         const computer = db.bigfix_computers.find(item => item.id === result.computer_id);
         const resolution = matchResolution(db.bigfix_failure_resolutions, result);
         const diagnosis = diagnoseFailure(result, computer, action, resolution);
-        return {
+        const providerAnalysis = await analyzeWithHybridProvider(db, result, computer, action, resolution, diagnosis);
+        analysis.push({
           actionResultId: result.id,
           computerId: computer?.bigfix_id || '',
           computerName: computer?.name || 'Unknown',
@@ -1404,14 +1594,15 @@ ${targetXml}
           lineNumber: result.line_number || 0,
           logExcerpt: result.log_excerpt || '',
           retryCount: result.retry_count || 0,
-          rootCause: diagnosis.rootCause,
-          confidence: diagnosis.confidence,
-          evidence: diagnosis.evidence,
-          detail: diagnosis.detail,
+          rootCause: providerAnalysis.rootCause,
+          confidence: providerAnalysis.confidence,
+          evidence: providerAnalysis.evidence,
+          detail: providerAnalysis.detail,
+          analysisSource: providerAnalysis.source,
           computerOnline: diagnosis.computerOnline,
-          proposedResolution: proposedResolutionForFailure(resolution, diagnosis),
-        };
-      });
+          proposedResolution: providerAnalysis.proposedResolution,
+        });
+      }
       return { success: true, analysis, failedComputers: analysis.length, totalComputers: action.target_count || 0, actionName: action.name };
     }
 
