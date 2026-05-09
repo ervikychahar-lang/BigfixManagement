@@ -441,6 +441,7 @@ function parseActionsXML(xml) {
       EndTime: parseTag(block, 'EndTime'),
       CreatedBy: parseTag(block, 'CreatedBy') || parseTag(block, 'Issuer'),
       IsDistributed: parseTag(block, 'IsDistributed') || 'false',
+      ActionScript: parseTag(block, 'ActionScript'),
     });
   }
   return actions;
@@ -648,6 +649,20 @@ async function queryComputers(consoleConfig) {
       }),
     },
     {
+      relevance: '(id of it as string, name of it | "", operating system of it | "", ip address of it as string | "", last report time of it as string | "", if exists client version of it then client version of it as string else "", if active flag of it then "true" else "false") of bes computers',
+      map: row => ({
+        ID: row[0] || '',
+        Name: row[1] || row[0] || '',
+        OS: row[2] || '',
+        IPAddress: row[3] || '',
+        LastReport: row[4] || '',
+        AgentVersion: row[5] || '',
+        IsOnline: row[6] || '',
+        Subnet: '',
+        CustomSiteCount: '0',
+      }),
+    },
+    {
       relevance: '(id of it as string, name of it | "", operating system of it | "", last report time of it as string | "") of bes computers',
       map: row => ({
         ID: row[0] || '',
@@ -822,15 +837,18 @@ async function fetchAndStoreActionStatus(db, consoleConfig, consoleId, actionBig
       db.bigfix_computers.push(computer);
     }
     if (!computer) continue;
+    const lineNumber = parseInt(result.LineNumber, 10) || 0;
+    const scriptLine = getActionScriptLine(db, action, lineNumber);
+    const logExcerpt = appendLogDetail(result.LogExcerpt, scriptLine ? `Failing ActionScript line ${lineNumber}: ${scriptLine}` : '');
     upsertBy(db, 'bigfix_action_results', item => item.action_id === action.id && item.computer_id === computer.id, {
       action_id: action.id,
       computer_id: computer.id,
       status: normalizeResultStatus(result.Status || result.State),
       state: result.State,
-      line_number: parseInt(result.LineNumber, 10) || 0,
+      line_number: lineNumber,
       result_code: result.ResultCode,
       error_message: result.ErrorMessage,
-      log_excerpt: result.LogExcerpt,
+      log_excerpt: logExcerpt,
       retry_count: parseInt(result.RetryCount, 10) || 0,
       started_at: result.StartedAt || null,
       completed_at: result.CompletedAt || null,
@@ -847,6 +865,26 @@ async function fetchAndStoreActionStatus(db, consoleConfig, consoleId, actionBig
   action.status = deriveActionStatusFromResults(storedResults, action.status);
   action.updated_at = now();
   return { count: parsed.length };
+}
+
+function actionScriptForAction(db, action) {
+  const metadataScript = String(action?.metadata?.action_script || '');
+  if (metadataScript) return metadataScript;
+  const content = db.bigfix_content.find(item => item.id === action?.content_id);
+  return String(content?.action_script || '');
+}
+
+function getActionScriptLine(db, action, lineNumber) {
+  if (!lineNumber || lineNumber < 1) return '';
+  const script = actionScriptForAction(db, action);
+  if (!script) return '';
+  return String(script).split(/\r?\n/)[lineNumber - 1]?.trim() || '';
+}
+
+function appendLogDetail(logExcerpt, detail) {
+  if (!detail) return logExcerpt || '';
+  if (String(logExcerpt || '').includes(detail)) return logExcerpt || '';
+  return [logExcerpt, detail].filter(Boolean).join(' | ');
 }
 
 function sortByCreatedDesc(items) {
@@ -964,6 +1002,9 @@ function diagnoseFailure(result, computer, action, resolution) {
   } else if (/timeout|timed out|unreachable|connection/.test(text)) {
     rootCause = 'Network or endpoint response timeout';
     detail = 'The action did not complete within the expected window. Check endpoint connectivity, relay path, and whether the process is still running.';
+  } else if (result.line_number || /failing actionscript line/i.test(logExcerpt)) {
+    rootCause = 'ActionScript failed during execution';
+    detail = logExcerpt || `The action failed at ActionScript line ${result.line_number}. Review and correct that line before redeploying.`;
   } else if (!message && !code) {
     confidence = 'low';
   }
@@ -1037,6 +1078,10 @@ function proposedResolutionForFailure(resolution, diagnosis) {
     title = 'Restore endpoint or relay connectivity';
     description = 'The log evidence points to connectivity or timeout. Manual network/client validation is required before redeploy.';
     steps = ['Confirm the endpoint is online and reporting.', 'Check relay connectivity and firewall path.', 'Redeploy after the endpoint reports successfully.'];
+  } else if (/failing actionscript line|actionscript failed|line number/i.test(text)) {
+    title = 'Correct ActionScript line and redeploy';
+    description = 'The action failed at a specific ActionScript line. Fix the script line shown in the log evidence before redeploying.';
+    steps = ['Review the captured failing ActionScript line.', 'Correct the syntax or command in the source task/fixlet action script.', 'Redeploy only after the corrected script is validated.'];
   }
 
   const script = type === 'auto' ? generateActionScriptFromSteps(steps, diagnosis, title) : '';
@@ -1429,20 +1474,20 @@ async function handleAction(body) {
       const requestedSites = body.siteId && body.siteId !== 'all'
         ? db.bigfix_sites.filter(site => site.console_id === body.consoleId && site.name === body.siteId)
         : db.bigfix_sites.filter(site => site.console_id === body.consoleId);
-      const xmlParts = [];
-      if (requestedSites.length > 0) {
-        for (const site of requestedSites) xmlParts.push(await fetchContentForSite(consoleConfig, contentType, site));
-      } else {
-        xmlParts.push(await fetchContentForSite(consoleConfig, contentType, null));
-      }
-      let parsed = xmlParts.flatMap(xml => parseContentXML(xml));
-      console.log(`Fetched ${parsed.length} ${contentType}s by REST for ${requestedSites.length || 1} site scope(s)`);
+      const sitesForQuery = requestedSites.length > 0 ? requestedSites : [{ name: body.siteId || 'all' }];
+      const queryResults = [];
+      for (const site of sitesForQuery) queryResults.push(...await queryContent(consoleConfig, contentType, site.name));
+      let parsed = queryResults;
+      console.log(`Fetched ${parsed.length} ${contentType}s by relevance for ${sitesForQuery.length} site scope(s)`);
       if (parsed.length === 0) {
-        const sitesForQuery = requestedSites.length > 0 ? requestedSites : [{ name: body.siteId || 'all' }];
-        const queryResults = [];
-        for (const site of sitesForQuery) queryResults.push(...await queryContent(consoleConfig, contentType, site.name));
-        parsed = queryResults;
-        console.log(`Fetched ${parsed.length} ${contentType}s by relevance fallback`);
+        const xmlParts = [];
+        if (requestedSites.length > 0) {
+          for (const site of requestedSites) xmlParts.push(await fetchContentForSite(consoleConfig, contentType, site));
+        } else {
+          xmlParts.push(await fetchContentForSite(consoleConfig, contentType, null));
+        }
+        parsed = xmlParts.flatMap(xml => parseContentXML(xml));
+        console.log(`Fetched ${parsed.length} ${contentType}s by REST fallback`);
       }
       for (const item of parsed) {
         const siteId = decodeBigFixValue(item.SiteID || item.SourceName || body.siteId || '');
@@ -1504,6 +1549,10 @@ async function handleAction(body) {
           end_time: action.EndTime || null,
           created_by: action.CreatedBy,
           is_distributed: action.IsDistributed === 'true',
+          metadata: {
+            ...(db.bigfix_actions.find(item => item.console_id === body.consoleId && item.bigfix_id === action.ID)?.metadata || {}),
+            action_script: action.ActionScript || '',
+          },
           updated_at: now(),
         });
         await fetchAndStoreActionStatus(db, consoleConfig, body.consoleId, action.ID);
@@ -1554,7 +1603,7 @@ ${targetXml}
         end_time: null,
         created_by: consoleConfig.username,
         is_distributed: false,
-        metadata: {},
+        metadata: { action_script: content.action_script || '' },
         created_at: now(),
         updated_at: now(),
       };
